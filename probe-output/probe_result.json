@@ -1,0 +1,97 @@
+{
+  "timestamp_utc": "2026-11-02T00:44:23.605581+00:00",
+  "mode": "live",
+  "adapter": "psx-dps",
+  "requests_executed": 3,
+  "calls": [
+    {
+      "id": "symbols",
+      "description": "Symbol Directory",
+      "status": "SUCCESS",
+      "sha256": "5a44bb7f21f5170221061d112fd66427dcb2c64c236f35d36890a2e716710831",
+      "record_count": 559,
+      "duration_ms": 3365.68,
+      "field_coverage": {
+        "type": "list_of_dicts (count=559)",
+        "fields": {
+          "symbol": "str",
+          "name": "str",
+          "sectorName": "str",
+          "isETF": "bool",
+          "isDebt": "bool"
+        }
+      },
+      "error": null
+    },
+    {
+      "id": "snapshot",
+      "description": "Whole-Market Snapshot",
+      "status": "SUCCESS",
+      "sha256": "5c5bb5a3ab97f01423ddf4e1dde6b6f023c6563c63b653ad2ea26a8ef9f554d5",
+      "record_count": 559,
+      "duration_ms": 3963.18,
+      "field_coverage": {
+        "type": "dict",
+        "fields": {
+          "source": "str",
+          "captured_at": "str",
+          "session": "str",
+          "rows": "list(count=559) with keys ['symbol', 'current', 'change', 'volume', 'name']"
+        }
+      },
+      "error": null
+    },
+    {
+      "id": "eod_ogdc",
+      "description": "EOD Daily Bars: OGDC",
+      "status": "ERROR",
+      "sha256": null,
+      "record_count": 0,
+      "duration_ms": 0.0,
+      "field_coverage": null,
+      "error": "/timeseries/eod/OGDC: HTTP 404"
+    },
+    {
+      "id": "eod_engro",
+      "description": "EOD Daily Bars: ENGRO",
+      "status": "ERROR",
+      "sha256": null,
+      "record_count": 0,
+      "duration_ms": 0.0,
+      "field_coverage": null,
+      "error": "/timeseries/eod/ENGRO: HTTP 404"
+    },
+    {
+      "id": "indices",
+      "description": "Current Market Indices",
+      "status": "SUCCESS",
+      "sha256": "249fcfc29ec1024162c944e8c70d30866139bb2361be1c72cf6ca7fe38f40b6d",
+      "record_count": 18,
+      "duration_ms": 5.92,
+      "field_coverage": {
+        "type": "list_of_dicts (count=18)",
+        "fields": {
+          "Index": "str",
+          "High": "str",
+          "Low": "str",
+          "Current": "str",
+          "Change": "str",
+          "% Change": "str"
+        }
+      },
+      "error": null
+    },
+    {
+      "id": "intraday_ogdc",
+      "description": "Intraday Ticks: OGDC",
+      "status": "ERROR",
+      "sha256": null,
+      "record_count": 0,
+      "duration_ms": 0.0,
+      "field_coverage": null,
+      "error": "/timeseries/int/OGDC: HTTP 404"
+    }
+  ],
+  "budget_used_24h": 26,
+  "budget_remaining_24h": 224
+}

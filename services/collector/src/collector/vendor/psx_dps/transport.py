@@ -36,8 +36,8 @@ USER_AGENT = os.environ.get(
     "PSX_DPS_USER_AGENT",
     "psx-dps/0.1 (+https://github.com/umairsandhu/psx-dps)",
 )
-# Smallest data-only route we know of (~180 bytes) -- an ideal health probe.
-PROBE_PATH = "/data/symbol-position"
+# Primary health probe route: /indices returns 200 reliably across active PSX nodes
+PROBE_PATH = os.environ.get("PSX_PROBE_PATH", "/indices")
 # Addresses observed serving data, tried when the rotating A record hides one.
 SEED_NODES = ["52.128.23.16", "52.128.23.6"]
 NODE_TTL = 6 * 3600

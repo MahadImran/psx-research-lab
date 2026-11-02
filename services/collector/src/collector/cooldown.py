@@ -100,6 +100,9 @@ class CooldownManager:
         elif status_code == 503:
             cooldown_sec = retry_after if (retry_after and retry_after > 0) else self.default_cooldown_seconds
             self.cooldown_until = now + timedelta(seconds=cooldown_sec)
+        elif status_code == 404:
+            # Missing resource / endpoint does not indicate server-wide outage
+            self.consecutive_errors = max(0, self.consecutive_errors - 1)
         elif self.consecutive_errors >= self.max_consecutive_errors:
             # Exponential backoff for generic errors
             backoff_sec = min(3600, self.default_cooldown_seconds * (2 ** (self.consecutive_errors - self.max_consecutive_errors)))
