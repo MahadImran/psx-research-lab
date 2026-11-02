@@ -10,18 +10,16 @@
 ## 1. Primary Upstream Source: `dps.psx.com.pk` (`psx-dps`)
 
 ### Authentication & Header Enforcement
-Since September 2026, PSX enforces an anti-scraping session token:
-- **Session Token Extraction:** Extracted dynamically from `https://dps.psx.com.pk/` via regex pattern `window\.__ps\s*=\s*(\{.*?\})` -> property `_k`.
+- **Dynamic Session Token:** Extracted dynamically from `https://dps.psx.com.pk/` via `PSXTokenProvider`.
 - **Mandatory Headers:**
   - `X-Req-Id: <_k token>`
   - `X-Requested-With: XMLHttpRequest`
   - `Referer: https://dps.psx.com.pk/`
   - `Accept-Encoding: gzip, deflate`
-- **Tls Pinning & Health Discovery:** TLS connections validate real hostname `dps.psx.com.pk` with SNI against pinned IP addresses. Node health is probed against `/indices` (returns 200 with 18 indices across all active nodes).
 
 ### Empirical Endpoint Verified Shapes
 1. **Whole-Market Board Snapshot:**
-   - Path: `/market-watch` (or `/data/symbol-position` fallback via 559 `ALLSHR` constituents)
+   - Path: `/market-watch`
    - Scope: ~496 actively trading tickers in a single HTTP call
    - Payload: Array of `[symbol, current, change, percentChange, volume, high, low]`
 2. **Historical EOD Timeseries:**
@@ -38,7 +36,7 @@ Since September 2026, PSX enforces an anti-scraping session token:
    - Scope: 712 symbols for that trading day
    - Fields: `open`, `high`, `low`, `close`, `change`, `percentChange`, `volume`
 5. **Ticker Aliases & Restructurings:**
-   - `ENGRO` was restructured into `ENGROH` (Engro Holdings Ltd) and `EFERT`. Requests for `ENGRO` are mapped to `ENGROH` to retrieve all 1,223 daily bars and 876 intraday ticks.
+   - `ENGRO` restructured into `ENGROH` and `EFERT`. Requests for `ENGRO` map to `ENGROH`.
 
 ---
 
@@ -47,6 +45,11 @@ Since September 2026, PSX enforces an anti-scraping session token:
 - **Open / Close / Volume:** Non-negative, finite numbers.
 - **Revisioning:** Revisions increment from `0`. Only the latest accepted revision has `is_active = 1`.
 - **Settlement Discrepancies:** When post-close settlement prices from `POST /historical` adjust preliminary intraday quotes, a new revision (`revision = 1`) is created with an audit trail in `discrepancies`.
+- **Data Quality Grades:**
+  - `GRADE_A`: Complete OHLCV bars satisfying strict geometric invariants.
+  - `GRADE_B`: Valid price bars with nullable High/Low (benchmark indices).
+  - `GRADE_C`: Volume-only or synthetic baseline records.
+  - `QUARANTINE`: Isolated defective records.
 
 ---
 
@@ -63,39 +66,41 @@ Since September 2026, PSX enforces an anti-scraping session token:
 - **Annual Growth:** ~140 MB / year of compressed `.json.gz` files.
 - **Git Repository Dynamics:**
   - **Years 1–3 (< 500 MB):** Direct Git tree operations and API commits perform efficiently. Shallow clones (`fetch-depth: 1`) in GitHub Actions remain under 5 seconds.
-  - **Years 3–5 (500 MB – 1 GB):** Reaches GitHub's soft recommended repository size. Ephemeral runner clone times increase without sparse-checkout or shallow history.
+  - **Years 3–5 (500 MB – 1 GB):** Reaches GitHub's soft recommended repository size.
   - **Mitigation & Retention Strategy:** Annual archive releases (`git bundle` or release tarballs) preserve long-term history while active working repository keeps recent 24-month rolling history.
 - **Recovery Objectives (RPO / RTO):**
-  - **RPO (Recovery Point Objective):** 1 trading day (nightly immutable raw commit and D1 export).
+  - **RPO (Recovery Point Objective):** 1 trading day (nightly immutable raw commit).
   - **RTO (Recovery Time Objective):** < 15 minutes (shallow clone from private GitHub archive + D1 batch schema rehydration).
-- **Historical Data Limitations & Provenance:**
-  - `/timeseries/eod/<SYMBOL>` bars are **raw unadjusted settlement close** prices, NOT dividend- or split-adjusted.
-  - High and Low values are omitted in `/timeseries/eod/` by PSX and are therefore nullable in `daily_bars`. They are never fabricated.
-  - Accurate backtesting requires combining raw prices with corporate action adjustment factors (bonus shares, dividends, rights offerings).
 
 ---
 
-## 4. Integrity Manifest Contract (`manifests/YYYY-MM-DD.json`)
+## 4. Cumulative Integrity Manifest Contract (`manifests/YYYY-MM-DD.json`)
 ```json
 {
   "manifestVersion": "1.0.0",
-  "generatedAtUtc": "2026-11-02T12:17:00Z",
   "tradingDate": "2026-11-02",
-  "source": "psx-dps",
-  "totalBars": 712,
-  "totalSnapshots": 496,
-  "totalIndices": 18,
-  "payloadSha256": "8f3...64-char-hex",
-  "archivePath": "raw/2026/11/02/psx-dps_snapshot_121700Z_4a8b1c2d.json.gz"
+  "generatedAtUtc": "2026-11-02T04:00:28Z",
+  "verifiedArchiveFiles": [
+    "raw/2026/11/02/dps_index_summary_gha-41386016819.json.gz",
+    "raw/2026/11/02/dps_snapshot_gha-41386016819.json.gz"
+  ],
+  "cycles": [
+    {
+      "runId": "gha-41386016819",
+      "timestamp": "2026-11-02T04:00:28Z",
+      "recordCount": 1,
+      "sha256": "6d50694ec3269d0d8cb30bfd30a47f02ea26871a9bf28151f11e9f131a4cbb79"
+    }
+  ]
 }
 ```
 
 ---
 
-## 5. Quarantine Criteria
-A record is quarantined (`is_quarantined = 1`, `quarantine_reason = '...'`) if:
+## 5. Quarantine & Geometry Criteria
+A record is quarantined (`is_quarantined = 1`, `quarantine_reason = '...'`, `dataGrade = 'QUARANTINE'`) if:
 1. `close <= 0` or `open <= 0` or `volume < 0`
-2. `high` and `low` are non-null but `high < low`
-3. Prices contain `NaN` or non-numeric tokens
-4. Missing required symbol or invalid date format
-Quarantined records are isolated and excluded from active serving.
+2. `high` and `low` are non-null and `high < low`
+3. Geometric candle violation: `high < max(open, close)` or `low > min(open, close)`
+4. Prices contain `NaN` or non-numeric tokens
+5. Missing required symbol or invalid date format

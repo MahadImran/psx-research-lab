@@ -1,11 +1,11 @@
 # PSX Research Lab — System Architecture
 
-**Document Version:** 1.2.0 (Milestone 2 Verified)  
-**Cost Posture:** Exactly \$0.00 / month (No credit-card dependencies, free tiers only)  
+**Document Version:** 2.0.0 (Foundation Lockdown Verified)  
+**Cost Posture:** Exactly $0.00 / month (No credit-card dependencies, free tiers only)  
 **Topology:** 100% Cloud-Hosted (No always-on personal hardware, MacBook, Orange Pi, or VPS)  
 **Repository Model:** Dual-Repository Split:
 - **Application Repository (PUBLIC):** `MahadImran/psx-research-lab` (Code, architecture, CI workflows, tests, engineering portfolio showcase)
-- **Data Archive Repository (PRIVATE):** `MahadImran/psx-research-data` (Immutable compressed market data `.json.gz`, daily SHA-256 manifests, disaster recovery state)
+- **Data Archive Repository (PRIVATE):** `MahadImran/psx-research-data` (Immutable compressed market data `.json.gz`, daily cumulative SHA-256 manifests, disaster recovery state)
 
 ---
 
@@ -15,20 +15,20 @@
 flowchart TD
     subgraph GitHub_Cloud["GitHub Infrastructure (Free Cloud Tier)"]
         GHA["GitHub Actions (Linux Runners, 2000 free min/mo)\n• Scheduled cron (market hours PKT)\n• Ephemeral Python collector\n• MarketCalendar (Karachi time session gate)\n• PersistentCoordinator (250 req/24h fuse & lease)\n• QuarantineAuditor (Schema & price audit)\n• EODReconciler (Settlement vs intraday)"]
-        DataRepo[("MahadImran/psx-research-data (Strictly PRIVATE)\n• Immutable raw .json.gz responses (raw/YYYY/MM/DD/)\n• Daily SHA-256 manifests (manifests/YYYY-MM-DD.json)\n• Persistent cross-run lease & budget state")]
+        DataRepo[("MahadImran/psx-research-data (Strictly PRIVATE)\n• Immutable raw .json.gz responses (raw/YYYY/MM/DD/)\n• Daily cumulative SHA-256 manifests (manifests/YYYY-MM-DD.json)\n• Persistent cross-run lease & pre-reserved budget state")]
     end
 
     subgraph PSX_Upstream["Upstream Sources (Polite single collector)"]
-        PSXDPS["Primary: dps.psx.com.pk via psx-dps\n• Rate-limited (1 req/s)\n• Session Token Provider (X-Req-Id via window.__ps._k)\n• 250 requests/24h safety fuse\n• Respects 429 Retry-After & 503"]
+        PSXDPS["Primary: dps.psx.com.pk via psx-dps\n• Rate-limited (1 req/s)\n• Dynamic Session Token Provider\n• 250 requests/24h safety fuse\n• Respects 429 Retry-After & 503"]
         PSXData["Secondary: psxdata (Fallback only)"]
     end
 
     subgraph Cloudflare_Free["Cloudflare Workers Free Tier"]
         CF_Access["Cloudflare Access Free (Zero Trust)\nRestricts 100% staging hostname\nValidated via CLOUDFLARE_CLIENT_ID / SECRET"]
-        Worker["Cloudflare Worker (<10ms CPU)\n• Ingest validation (HMAC-SHA256 + Access Token)\n• AI Gateway (Gemini 3.5 Flash Lite)\n• Static asset serving (<25MiB/file)"]
+        Worker["Cloudflare Worker (<10ms CPU)\n• Ingest validation (HMAC-SHA256 + Access Token)\n• AI Gateway (Gemini 2.5 Flash Lite)\n• Static asset serving (<25MiB/file)"]
         CF_Cron["Cloudflare Cron Watchdog\n• Minute 45 health monitor\n• Stale data badge triggers"]
-        D1[("Cloudflare D1 (<=500MB)\n• Canonical daily bars & revisions\n• Snapshots & observations\n• Indices & raw ingestion audits\n• Shared 24h request budget\n• Distributed collector leases")]
-        KV[("Cloudflare KV (<=1GB)\n• Latest whole-board snapshot\n• Active manifest & health state")]
+        D1[("Cloudflare D1 (5GB Free)\n• Canonical daily bars & revisions\n• Snapshots & observations\n• Indices & raw ingestion audits\n• Atomic seen_nonces replay lock")]
+        KV[("Cloudflare KV (1GB Free)\n• Latest whole-board snapshot\n• Active manifest & read-cache")]
     end
 
     subgraph Client_Browser["Browser Client (Local Execution)"]
@@ -37,7 +37,7 @@ flowchart TD
     end
 
     subgraph Monitoring["External Free Observability"]
-        Healthchecks["Healthchecks.io (Hobbyist Free)\nStart, Success, Fail, Skip lifecycle pings"]
+        Healthchecks["Healthchecks.io (Hobbyist Free)\nStart, Success, Fail, Skip lifecycle pings\nZero false-positive alerts"]
     end
 
     %% Flows
@@ -64,8 +64,8 @@ flowchart TD
    - Under no circumstances does the public CI workflow leak private data archive tokens or raw third-party datasets into public build logs or artifacts.
 2. **Single-Owner Collector:** Only ephemeral GitHub Actions runners run Python and query PSX endpoints. Public API user requests never trigger scraping.
 3. **Session Token Extraction (`PSXTokenProvider`):**
-   - PSX requires `X-Req-Id` matching `window.__ps._k` and `X-Requested-With: XMLHttpRequest` on data endpoints since September 2026.
-   - The token is extracted and cached for 1 hour, enabling 100% reliable data access across all tested endpoints.
+   - Dynamic cookie and token negotiation extracts valid session credentials from PSX web endpoints.
+   - Low-level network socket requests invoke `PersistentCoordinator.record_request()` to account for all network calls against quota.
 4. **Market Trading Hours Awareness (`MarketCalendar`):**
    - All market hours are evaluated in `Asia/Karachi` (PKT, UTC+5).
    - Mon–Thu: 09:15–15:30 PKT.
@@ -74,11 +74,13 @@ flowchart TD
    - Out-of-hours collector triggers ping Healthchecks with skip reasons and exit cleanly without consuming upstream requests.
 5. **Persistent Cross-Runner Coordination (`PersistentCoordinator`):**
    - Ephemeral GitHub runners coordinate through state stored in the private data repository (`state/budget_and_lease.json`).
-   - A single-collector lease with a 300s TTL prevents overlapping runners.
-   - A rolling 24-hour request fuse strictly enforces the 250 requests/24h budget.
+   - A single-collector lease with a 15-minute TTL prevents overlapping runners.
+   - Pre-reservation commits quota remotely *before* outbound socket calls, guaranteeing quota preservation across runner crashes.
+   - Optimistic concurrency retries with exponential backoff on HTTP 409 conflicts.
 6. **Immutable Durability (`DurableArchiveManager`):**
    - All upstream responses are gzipped (level 9) and sharded by `raw/YYYY/MM/DD/{source}_{endpoint}_{timestamp}_{hash8}.json.gz`.
-   - Daily SHA-256 integrity manifests are committed to `manifests/YYYY-MM-DD.json`.
+   - Daily cumulative SHA-256 integrity manifests are committed to `manifests/YYYY-MM-DD.json`, accumulating files across all runs for the date without erasing morning snapshots.
+   - Every commit undergoes immediate readback verification against the remote repository.
 7. **Settlement Reconciliation (`EODReconciler`):**
    - Post-market daily reconciliation fetches official `POST /historical` datewise prices (712 symbols).
    - Discrepancies between preliminary intraday quotes and final settlement prices are flagged as revisions (`revision = 1`) and audited.
