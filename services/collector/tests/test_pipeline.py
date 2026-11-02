@@ -39,8 +39,8 @@ def test_pipeline_full_run_with_fixtures(tmp_path):
     archive_dir = str(tmp_path / "archive")
     state_file = str(tmp_path / "state.json")
 
-    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250)
-    mock_archive = DurableArchiveManager(token=None, local_archive_dir=archive_dir)
+    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250, require_remote=False)
+    mock_archive = DurableArchiveManager(token=None, local_archive_dir=archive_dir, require_remote=False)
     mock_hc = HealthchecksNotifier(ping_url="https://hc-ping.com/test-uuid")
 
     # Mock adapter responses
@@ -107,7 +107,7 @@ def test_pipeline_fails_closed_on_archive_failure(tmp_path):
     archive_dir = str(tmp_path / "archive")
     state_file = str(tmp_path / "state.json")
 
-    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250)
+    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250, require_remote=False)
     mock_archive = MagicMock()
     mock_archive.stage_locally.return_value = ("raw/2026/11/02/file.json.gz", b"fake", "hash", 100)
     mock_archive.commit_file_to_archive.side_effect = ArchiveCommitError("Remote git commit failed (HTTP 500)")
@@ -143,8 +143,8 @@ def test_pipeline_reports_ingest_failure(tmp_path):
     archive_dir = str(tmp_path / "archive")
     state_file = str(tmp_path / "state.json")
 
-    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250)
-    mock_archive = DurableArchiveManager(token=None, local_archive_dir=archive_dir)
+    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250, require_remote=False)
+    mock_archive = DurableArchiveManager(token=None, local_archive_dir=archive_dir, require_remote=False)
     mock_hc = HealthchecksNotifier(ping_url="https://hc-ping.com/test-uuid")
 
     mock_adapter = MagicMock()
