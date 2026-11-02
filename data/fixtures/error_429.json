@@ -1,0 +1,8 @@
+{
+  "status_code": 429,
+  "error": "Too Many Requests",
+  "headers": {
+    "Retry-After": "300"
+  },
+  "message": "Rate limit exceeded. Please retry after cooldown period."
+}

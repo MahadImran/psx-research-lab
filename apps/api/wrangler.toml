@@ -1,0 +1,24 @@
+name = "psx-research-lab-api"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Cloudflare Free Constraints:
+# 10ms CPU limit, 100k requests/day, 50 subrequests/call
+# No R2, No paid workers
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "psx-research-d1"
+database_id = "local-d1-placeholder"
+
+# KV Namespace binding (latest snapshot & fast cached time partitions)
+[[kv_namespaces]]
+binding = "KV"
+id = "local-kv-placeholder"
+
+# Cron Triggers (max 5 on Free tier)
+# Watchdog runs at minute 45 of each hour
+[triggers]
+crons = ["45 * * * *"]

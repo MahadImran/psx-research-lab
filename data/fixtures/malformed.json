@@ -1,0 +1,17 @@
+{
+  "source": "untrusted-source",
+  "tradingDate": "2026-10-30",
+  "observations": [
+    {
+      "symbol": "OGDC",
+      "current": -150.0,
+      "change": 99999999.0,
+      "volume": -500
+    },
+    {
+      "symbol": "",
+      "current": "NOT_A_NUMBER",
+      "volume": null
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "psx-research-lab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private-first zero-dollar Pakistan Stock Exchange market research platform",
+  "scripts": {
+    "doctor": "bash scripts/doctor.sh",
+    "lint": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" lint",
+    "typecheck": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" typecheck",
+    "test": "pnpm --filter \"./packages/*\" --filter \"./apps/*\" test",
+    "test:collector": "cd services/collector && pytest",
+    "test:all": "pnpm test && pnpm test:collector"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.7",
+    "prettier": "^3.5.2"
+  },
+  "packageManager": "pnpm@10.15.1"
+}

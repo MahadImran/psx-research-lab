@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+.venv/
+env/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Cloudflare / Wrangler
+.wrangler/
+.dev.vars
+.dev.vars.*
+dist/
+build/
+.output/
+
+# macOS / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.Rhistory
+
+# Testing & Coverage
+coverage/
+.nyc_output/
+htmlcov/
+.coverage
+.coverage.*
+
+# Ephemeral runtime data / logs
+*.log
+local_cache/
+scratch/
+tmp/
+.temp/
+
+# Secrets & Local Env
+.env
+.env.local
+.env.*.local
+*.pem
+*.key

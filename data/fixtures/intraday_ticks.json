@@ -1,0 +1,26 @@
+[
+  {
+    "symbol": "OGDC",
+    "sequenceId": 1,
+    "timestampUtc": "2026-10-30T04:15:30Z",
+    "marketTimeKarachi": "09:15:30",
+    "price": 135.0,
+    "volume": 500
+  },
+  {
+    "symbol": "OGDC",
+    "sequenceId": 2,
+    "timestampUtc": "2026-10-30T04:15:30Z",
+    "marketTimeKarachi": "09:15:30",
+    "price": 135.0,
+    "volume": 500
+  },
+  {
+    "symbol": "OGDC",
+    "sequenceId": 3,
+    "timestampUtc": "2026-10-30T04:16:10Z",
+    "marketTimeKarachi": "09:16:10",
+    "price": 135.25,
+    "volume": 1200
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "code": "KSE100",
+    "current": 85250.12,
+    "change": 450.21,
+    "changePercent": 0.53,
+    "volume": 254800900,
+    "tradingDate": "2026-10-30",
+    "fetchedAtUtc": "2026-10-30T10:30:00Z"
+  },
+  {
+    "code": "KSE30",
+    "current": 26840.50,
+    "change": 120.30,
+    "changePercent": 0.45,
+    "volume": 120400500,
+    "tradingDate": "2026-10-30",
+    "fetchedAtUtc": "2026-10-30T10:30:00Z"
+  }
+]

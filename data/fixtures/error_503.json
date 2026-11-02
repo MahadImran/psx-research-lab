@@ -1,0 +1,5 @@
+{
+  "status_code": 503,
+  "error": "Service Unavailable",
+  "message": "PSX Data Portal upstream server temporarily unavailable."
+}

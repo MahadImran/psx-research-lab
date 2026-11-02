@@ -1,0 +1,25 @@
+name: Daily Encrypted Database Backup
+
+on:
+  schedule:
+    # Post-market daily reconciliation and backup (23:30 PKT = 18:30 UTC)
+    - cron: '30 18 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: psx-daily-backup
+  cancel-in-progress: false
+
+jobs:
+  export-and-archive:
+    name: Encrypted D1 Export to Private Archive Repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Export D1 State
+        run: |
+          echo "Daily encrypted export scaffold active. (Milestone 3 implementation)"

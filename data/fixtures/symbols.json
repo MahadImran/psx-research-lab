@@ -1,0 +1,8 @@
+[
+  { "symbol": "OGDC", "name": "Oil & Gas Development Company Limited", "sector": "OIL & GAS EXPLORATION COMPANIES", "isIndex": false },
+  { "symbol": "ENGRO", "name": "Engro Corporation Limited", "sector": "CHEMICAL", "isIndex": false },
+  { "symbol": "HUBC", "name": "The Hub Power Company Limited", "sector": "POWER GENERATION & DISTRIBUTION", "isIndex": false },
+  { "symbol": "LUCK", "name": "Lucky Cement Limited", "sector": "CEMENT", "isIndex": false },
+  { "symbol": "FFC", "name": "Fauji Fertilizer Company Limited", "sector": "FERTILIZER", "isIndex": false },
+  { "symbol": "KSE100", "name": "KSE 100 Index", "sector": "BENCHMARK_INDEX", "isIndex": true }
+]

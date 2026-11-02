@@ -1,0 +1,37 @@
+{
+  "source": "psx-dps",
+  "tradingDate": "2026-10-30",
+  "fetchedAtUtc": "2026-10-30T10:30:00Z",
+  "observations": [
+    {
+      "symbol": "OGDC",
+      "current": 136.20,
+      "change": 1.40,
+      "changePercent": 1.04,
+      "high": 137.50,
+      "low": 134.80,
+      "volume": 2450800,
+      "lastUpdated": "2026-10-30 15:29:55"
+    },
+    {
+      "symbol": "ENGRO",
+      "current": 285.50,
+      "change": -2.10,
+      "changePercent": -0.73,
+      "high": 289.00,
+      "low": 284.00,
+      "volume": 680400,
+      "lastUpdated": "2026-10-30 15:29:40"
+    },
+    {
+      "symbol": "HUBC",
+      "current": 118.75,
+      "change": 0.50,
+      "changePercent": 0.42,
+      "high": 120.00,
+      "low": 118.00,
+      "volume": 1420000,
+      "lastUpdated": "2026-10-30 15:28:10"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+name: Live PSX Bounded Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Probe execution mode (live or offline)"
+        required: true
+        default: "live"
+        type: choice
+        options:
+          - live
+          - offline
+
+concurrency:
+  group: psx-probe
+  cancel-in-progress: false
+
+jobs:
+  run-probe:
+    name: Execute Bounded Probe on GitHub Ubuntu Runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Bounded PSX Probe
+        id: probe
+        run: |
+          mkdir -p probe-output
+          python services/collector/src/collector/probe.py --mode ${{ inputs.mode }} --output-dir probe-output
+
+      - name: Publish Step Summary
+        if: always()
+        run: |
+          if [ -f probe-output/probe_result.md ]; then
+            cat probe-output/probe_result.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Probe Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psx-probe-results-${{ inputs.mode }}
+          path: probe-output/
+          retention-days: 7
