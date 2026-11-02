@@ -104,7 +104,30 @@ export async function verifyAndRecordNonce(
     return { valid: false, reason: 'Invalid nonce format' };
   }
 
-  // 1. If KV available, use fast atomic expiration check
+  // 1. Authoritative ACID atomic lock via D1 PRIMARY KEY constraint
+  if (db) {
+    try {
+      // Direct atomic INSERT: SQLite PRIMARY KEY enforces atomicity without check-then-act race
+      await db
+        .prepare('INSERT INTO seen_nonces (nonce, timestamp_sec) VALUES (?, ?)')
+        .bind(nonce, timestampSec)
+        .run();
+
+      // Write-through to KV for edge caching if available
+      if (kv) {
+        await kv.put(`nonce:${nonce}`, timestampSec.toString(), { expirationTtl: 600 }).catch(() => {});
+      }
+      return { valid: true };
+    } catch (err: any) {
+      const errStr = String(err?.message || err);
+      if (errStr.includes('UNIQUE') || errStr.includes('PRIMARY KEY')) {
+        return { valid: false, reason: 'Nonce already used (replay attack detected)' };
+      }
+      return { valid: false, reason: `Nonce persistence check failed: ${errStr}` };
+    }
+  }
+
+  // 2. Fallback to KV only when D1 is unconfigured (e.g. KV-only staging)
   if (kv) {
     const key = `nonce:${nonce}`;
     const existing = await kv.get(key);
@@ -114,30 +137,6 @@ export async function verifyAndRecordNonce(
     // Store nonce with 10-minute TTL (600 seconds)
     await kv.put(key, timestampSec.toString(), { expirationTtl: 600 });
     return { valid: true };
-  }
-
-  // 2. If D1 available, use durable seen_nonces table
-  if (db) {
-    try {
-      const existing = await db
-        .prepare('SELECT nonce FROM seen_nonces WHERE nonce = ?')
-        .bind(nonce)
-        .first();
-      if (existing) {
-        return { valid: false, reason: 'Nonce already used (replay attack detected)' };
-      }
-      await db
-        .prepare('INSERT INTO seen_nonces (nonce, timestamp_sec) VALUES (?, ?)')
-        .bind(nonce, timestampSec)
-        .run();
-      return { valid: true };
-    } catch (err: any) {
-      // Primary key conflict caught here
-      if (String(err).includes('UNIQUE') || String(err).includes('PRIMARY KEY')) {
-        return { valid: false, reason: 'Nonce already used (replay attack detected)' };
-      }
-      return { valid: false, reason: `Nonce persistence check failed: ${err.message}` };
-    }
   }
 
   // If neither KV nor D1 is present, fail closed

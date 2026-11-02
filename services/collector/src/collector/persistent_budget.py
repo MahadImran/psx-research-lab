@@ -172,12 +172,16 @@ class PersistentCoordinator:
                         expires_at = datetime.fromisoformat(existing_lease["expires_at"])
                         if now < expires_at and existing_lease.get("owner") != self.runner_id:
                             raise LeaseConflictError(f"Lease acquired by competitor {existing_lease.get('owner')} during commit conflict.")
-                    # Merge history
-                    all_history = fresh_state.get("history", []) + [
-                        h for h in state.get("history", [])
-                        if h not in fresh_state.get("history", [])
-                    ]
-                    state["history"] = all_history
+                    # Merge history keyed by unique tuple
+                    all_history_map = {
+                        (h.get("timestamp", ""), h.get("endpoint", ""), h.get("runner_id", "")): h
+                        for h in fresh_state.get("history", []) + state.get("history", [])
+                    }
+                    now = datetime.now(timezone.utc)
+                    cutoff = (now - timedelta(hours=24)).isoformat()
+                    merged_history = [h for h in all_history_map.values() if h.get("timestamp", "") >= cutoff]
+                    merged_history.sort(key=lambda x: x.get("timestamp", ""))
+                    state["history"] = merged_history
                     continue
 
                 if self.require_remote:
@@ -218,6 +222,36 @@ class PersistentCoordinator:
             logger.error("Failed to write local state: %s", e)
             return False
 
+    def is_lease_active(self) -> bool:
+        """Checks if this runner holds a valid, unexpired lease."""
+        if not self.active_lease:
+            return False
+        if self.active_lease.get("owner") != self.runner_id:
+            return False
+        try:
+            now = datetime.now(timezone.utc)
+            expires_at = datetime.fromisoformat(self.active_lease["expires_at"])
+            return now < expires_at
+        except Exception:
+            return False
+
+    def renew_lease(self, extension_seconds: int = 300) -> None:
+        """Extends lease expiration for active long-running collector jobs."""
+        state = self.load_remote_state()
+        current_lease = state.get("lease")
+        if not current_lease or current_lease.get("owner") != self.runner_id:
+            raise LeaseConflictError(f"Cannot renew lease: lease not held by {self.runner_id}")
+        now = datetime.now(timezone.utc)
+        expires_at = datetime.fromisoformat(current_lease["expires_at"])
+        if now >= expires_at:
+            raise LeaseConflictError(f"Cannot renew expired lease: expired at {current_lease['expires_at']}")
+        new_expiry = (now + timedelta(seconds=extension_seconds)).isoformat()
+        current_lease["expires_at"] = new_expiry
+        state["lease"] = current_lease
+        self.save_remote_state(state)
+        self.active_lease = current_lease
+        logger.info("Lease renewed for runner %s until %s", self.runner_id, new_expiry)
+
     def acquire_lease_and_sync(self) -> None:
         """
         Acquires single-collector lease, commits it remotely, and purges expired requests.
@@ -248,7 +282,7 @@ class PersistentCoordinator:
 
         # Purge requests older than 24h
         cutoff = (now - timedelta(hours=24)).isoformat()
-        self.history = [r for r in state.get("history", []) if r["timestamp"] >= cutoff]
+        self.history = [r for r in state.get("history", []) if r.get("timestamp", "") >= cutoff]
         state["history"] = self.history
 
         # Commit remotely and verify
@@ -259,15 +293,41 @@ class PersistentCoordinator:
         logger.info("Lease acquired successfully for runner %s until %s", self.runner_id, lease_expires)
 
     def release_lease(self) -> None:
-        """Releases the collector lease and syncs final history."""
+        """Releases the collector lease and syncs merged history without overwriting competing runner state."""
         try:
             state = self.load_remote_state()
-            if state.get("lease", {}).get("owner") == self.runner_id:
+            current_lease = state.get("lease")
+            if current_lease and current_lease.get("owner") == self.runner_id:
                 state["lease"] = None
-            state["history"] = self.history
+            else:
+                logger.warning(
+                    "Lease was no longer held by %s upon release (current owner: %s)",
+                    self.runner_id,
+                    current_lease.get("owner") if current_lease else "None",
+                )
+
+            # Merge history across runners (keyed by timestamp + endpoint + runner_id)
+            existing_entries = {
+                (h.get("timestamp", ""), h.get("endpoint", ""), h.get("runner_id", "")): h
+                for h in state.get("history", [])
+            }
+            for h in self.history:
+                key = (h.get("timestamp", ""), h.get("endpoint", ""), h.get("runner_id", ""))
+                existing_entries[key] = h
+
+            now = datetime.now(timezone.utc)
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            merged_history = [
+                h for h in existing_entries.values()
+                if h.get("timestamp", "") >= cutoff
+            ]
+            merged_history.sort(key=lambda x: x.get("timestamp", ""))
+            state["history"] = merged_history
+
             self.save_remote_state(state)
+            self.history = merged_history
             self.active_lease = None
-            logger.info("Lease cleanly released for runner %s", self.runner_id)
+            logger.info("Lease cleanly released and history merged for runner %s", self.runner_id)
         except Exception as e:
             logger.warning("Error releasing lease: %s", e)
             self.active_lease = None
@@ -275,30 +335,84 @@ class PersistentCoordinator:
     def get_remaining_requests(self) -> int:
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=24)).isoformat()
-        active = [r for r in self.history if r["timestamp"] >= cutoff]
+        active = [r for r in self.history if r.get("timestamp", "") >= cutoff]
         return max(0, self.daily_limit - len(active))
 
-    def record_request(self, endpoint: str) -> None:
+    def reserve_request(self, endpoint: str) -> None:
         """
-        Records an upstream request against the rolling 24h budget.
-        Raises BudgetExceededError if limit is met.
-        Immediately updates history in memory and attempts remote sync.
+        Durably reserves an upstream request quota BEFORE the network socket request is made.
+        Fails closed: if remote persistence cannot be committed, raises RemoteStateError or
+        BudgetExceededError, and the upstream request must NOT proceed.
         """
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=24)).isoformat()
-        self.history = [r for r in self.history if r["timestamp"] >= cutoff]
 
-        if len(self.history) >= self.daily_limit:
-            raise BudgetExceededError(
-                f"Rolling 24h upstream budget limit ({self.daily_limit}) reached! Cannot request {endpoint}."
-            )
+        if not self.is_lease_active():
+            # Refresh state to verify whether lease is still valid
+            fresh_state = self.load_remote_state() if (self.require_remote or self.token) else self._load_local_state()
+            current_lease = fresh_state.get("lease")
+            if not current_lease or current_lease.get("owner") != self.runner_id:
+                raise LeaseConflictError(
+                    f"Runner {self.runner_id} lost lease ownership. Cannot issue upstream request for {endpoint}."
+                )
+            if now >= datetime.fromisoformat(current_lease["expires_at"]):
+                raise LeaseConflictError(
+                    f"Runner {self.runner_id} lease expired at {current_lease['expires_at']}. Cannot issue request for {endpoint}."
+                )
+            self.active_lease = current_lease
 
-        entry = {
-            "timestamp": now.isoformat(),
-            "endpoint": endpoint,
-            "runner_id": self.runner_id,
-        }
-        self.history.append(entry)
+        if self.require_remote or self.token:
+            # Load remote state to inspect current budget
+            state = self.load_remote_state()
+            active = [r for r in state.get("history", []) if r.get("timestamp", "") >= cutoff]
+
+            if len(active) >= self.daily_limit:
+                raise BudgetExceededError(
+                    f"Rolling 24h upstream budget limit ({self.daily_limit}) reached! Pre-reservation rejected for {endpoint}."
+                )
+
+            entry = {
+                "timestamp": now.isoformat(),
+                "endpoint": endpoint,
+                "runner_id": self.runner_id,
+                "status": "RESERVED",
+            }
+            active.append(entry)
+            state["history"] = active
+
+            # Commit remotely before returning to caller
+            success = self.save_remote_state(state)
+            if not success:
+                raise RemoteStateError(f"Failed to durably commit request quota reservation for {endpoint}.")
+            self.history = active
+            logger.debug("Quota reserved and committed remotely for %s (%d/%d used)", endpoint, len(active), self.daily_limit)
+        else:
+            # Local development mode
+            state = self._load_local_state()
+            active = [r for r in state.get("history", []) if r.get("timestamp", "") >= cutoff]
+
+            if len(active) >= self.daily_limit:
+                raise BudgetExceededError(
+                    f"Rolling 24h upstream budget limit ({self.daily_limit}) reached! Pre-reservation rejected for {endpoint}."
+                )
+
+            entry = {
+                "timestamp": now.isoformat(),
+                "endpoint": endpoint,
+                "runner_id": self.runner_id,
+                "status": "RESERVED",
+            }
+            active.append(entry)
+            state["history"] = active
+            self._save_local_state(state)
+            self.history = active
+
+    def record_request(self, endpoint: str) -> None:
+        """
+        Records/reserves an upstream request against the rolling 24h budget.
+        Enforces durable reservation before outbound network requests.
+        """
+        self.reserve_request(endpoint)
 
     def sync_budget_to_remote(self) -> None:
         """Flushes recorded requests to remote state."""

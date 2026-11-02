@@ -305,8 +305,8 @@ app.post('/v1/admin/ingest', async (c) => {
     for (const bar of bars) {
       statements.push(
         db.prepare(
-          `INSERT OR REPLACE INTO daily_bars (source, symbol, trading_date, revision, open, high, low, close, volume, is_quarantined, quarantine_reason, payload_sha256, fetched_at_utc, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+          `INSERT OR REPLACE INTO daily_bars (source, symbol, trading_date, revision, open, high, low, close, volume, is_quarantined, quarantine_reason, data_grade, payload_sha256, fetched_at_utc, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
         ).bind(
           bar.source,
           bar.symbol,
@@ -319,6 +319,7 @@ app.post('/v1/admin/ingest', async (c) => {
           bar.volume,
           bar.isQuarantined ? 1 : 0,
           bar.quarantineReason || null,
+          bar.dataGrade || 'GRADE_B',
           bar.hash,
           bar.fetchedAtUtc
         )

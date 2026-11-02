@@ -106,6 +106,7 @@ class EODReconciler:
                 "close": close_val,
                 "volume": vol_val,
                 "revision": revision,
+                "dataGrade": QuarantineAuditor.classify_bar_grade(bar_candidate, is_valid),
                 "isQuarantined": not is_valid,
                 "quarantineReason": quarantine_reason,
                 "hash": bar_hash,

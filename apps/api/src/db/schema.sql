@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS daily_bars (
     volume INTEGER NOT NULL,
     is_quarantined INTEGER NOT NULL DEFAULT 0,
     quarantine_reason TEXT,
+    data_grade TEXT NOT NULL DEFAULT 'GRADE_B',
     payload_sha256 TEXT NOT NULL,
     fetched_at_utc TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1, -- Only latest accepted revision is active

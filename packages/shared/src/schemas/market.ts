@@ -20,6 +20,7 @@ export const DailyBarSchema = z.object({
   close: z.number().nonnegative(),
   volume: z.number().int().nonnegative(),
   revision: z.number().int().nonnegative().default(0),
+  dataGrade: z.enum(['GRADE_A', 'GRADE_B', 'GRADE_C', 'QUARANTINE']).default('GRADE_B'),
   isQuarantined: z.boolean().default(false),
   quarantineReason: z.string().nullable().optional(),
   hash: z.string().min(32),

@@ -207,9 +207,36 @@ class DurableArchiveManager:
         """
         Commits daily SHA-256 integrity manifest to manifests/{trading_date}.json
         with readback verification.
+        Preserves data durability: reads any existing manifest for this trading date and
+        accumulates verifiedArchiveFiles and cycles without erasing earlier collections.
         """
-        manifest_bytes = json.dumps(manifest_data, indent=2, sort_keys=True).encode("utf-8")
         rel_path = f"manifests/{trading_date}.json"
+
+        # Read existing manifest if present to accumulate references across runs
+        existing_bytes, _ = self.read_remote_file(rel_path, retries=1)
+        if existing_bytes:
+            try:
+                existing_manifest = json.loads(existing_bytes.decode("utf-8"))
+                # Merge verified files
+                existing_files = existing_manifest.get("verifiedArchiveFiles", [])
+                new_files = manifest_data.get("verifiedArchiveFiles", [])
+                manifest_data["verifiedArchiveFiles"] = sorted(list(set(existing_files + new_files)))
+                # Preserve run cycle history
+                existing_cycles = existing_manifest.get("cycles", [])
+                new_cycle = {
+                    "generatedAtUtc": manifest_data.get("generatedAtUtc"),
+                    "source": manifest_data.get("source"),
+                    "files": new_files,
+                    "totalBars": manifest_data.get("totalBars", 0),
+                    "totalSnapshots": manifest_data.get("totalSnapshots", 0),
+                    "totalIndices": manifest_data.get("totalIndices", 0),
+                    "payloadSha256": manifest_data.get("payloadSha256"),
+                }
+                manifest_data["cycles"] = existing_cycles + [new_cycle]
+            except Exception as e:
+                logger.warning("Error parsing existing manifest for accumulation: %s", e)
+
+        manifest_bytes = json.dumps(manifest_data, indent=2, sort_keys=True).encode("utf-8")
 
         # Local save
         full_local = os.path.join(self.local_archive_dir, rel_path)

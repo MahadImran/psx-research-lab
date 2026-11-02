@@ -131,3 +131,59 @@ def test_archive_manager_idempotent_existing_file():
         ok = mgr.commit_file_to_archive("raw/2026/11/02/existing.json.gz", test_content, "commit msg")
         assert ok is True
         assert mock_urlopen.call_count == 1
+
+
+def test_archive_manager_cumulative_manifest_merging(tmp_path):
+    """
+    Proves Critical Issue C: Multiple collections on the same trading day
+    accumulate verifiedArchiveFiles and cycles rather than erasing earlier runs.
+    """
+    local_dir = str(tmp_path / "archive")
+    mgr = DurableArchiveManager(token=None, local_archive_dir=local_dir, require_remote=False)
+
+    trading_date = "2026-11-02"
+
+    # Cycle 1: Morning collection
+    c1_payload = {
+        "manifestVersion": "1.0.0",
+        "generatedAtUtc": "2026-11-02T04:30:00Z",
+        "tradingDate": trading_date,
+        "source": "psx-dps",
+        "totalBars": 0,
+        "totalSnapshots": 100,
+        "totalIndices": 18,
+        "payloadSha256": "hash-c1",
+        "verifiedArchiveFiles": ["raw/2026/11/02/snapshot_043000Z.json.gz"],
+    }
+    manifest_rel = mgr.commit_daily_manifest(trading_date, c1_payload)
+
+    # Read back cycle 1 manifest
+    m1_bytes, _ = mgr.read_remote_file(manifest_rel)
+    m1 = json.loads(m1_bytes.decode("utf-8"))
+    assert m1["verifiedArchiveFiles"] == ["raw/2026/11/02/snapshot_043000Z.json.gz"]
+    assert len(m1.get("cycles", [])) == 0  # 1st cycle doesn't have existing prior cycles
+
+    # Cycle 2: Afternoon collection on same trading day
+    c2_payload = {
+        "manifestVersion": "1.0.0",
+        "generatedAtUtc": "2026-11-02T09:30:00Z",
+        "tradingDate": trading_date,
+        "source": "psx-dps",
+        "totalBars": 50,
+        "totalSnapshots": 100,
+        "totalIndices": 18,
+        "payloadSha256": "hash-c2",
+        "verifiedArchiveFiles": ["raw/2026/11/02/eod_reconciled_093000Z.json.gz"],
+    }
+    mgr.commit_daily_manifest(trading_date, c2_payload)
+
+    # Read back merged manifest
+    m2_bytes, _ = mgr.read_remote_file(manifest_rel)
+    m2 = json.loads(m2_bytes.decode("utf-8"))
+
+    # Both archive files must be listed!
+    assert "raw/2026/11/02/snapshot_043000Z.json.gz" in m2["verifiedArchiveFiles"]
+    assert "raw/2026/11/02/eod_reconciled_093000Z.json.gz" in m2["verifiedArchiveFiles"]
+    assert len(m2["verifiedArchiveFiles"]) == 2
+    assert len(m2.get("cycles", [])) == 1  # Cycle 1 preserved in history
+
