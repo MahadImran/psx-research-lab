@@ -15,8 +15,8 @@ export async function verifyCloudflareAccess(
 ): Promise<{ valid: boolean; reason?: string }> {
   // If Access credentials configured, require them
   if (config.accessClientId && config.accessClientSecret) {
-    const clientId = req.headers.get('CF-Access-Client-Id');
-    const clientSecret = req.headers.get('CF-Access-Client-Secret');
+    const clientId = req.headers.get('CF-Access-Client-Id') || req.headers.get('X-Cloudflare-Client-Id');
+    const clientSecret = req.headers.get('CF-Access-Client-Secret') || req.headers.get('X-Cloudflare-Client-Secret');
 
     if (!clientId || !clientSecret) {
       return { valid: false, reason: 'Missing Cloudflare Access service token headers' };

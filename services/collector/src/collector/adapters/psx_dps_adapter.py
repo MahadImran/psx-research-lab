@@ -1,8 +1,7 @@
 """
 PSX DPS Source Adapter.
 Wraps the pinned umairsandhu/psx-dps client with request budgeting,
-circuit breaking, timeout controls, fallback to verified constituents,
-and SHA-256 raw response hashing.
+session token extraction, circuit breaking, and SHA-256 raw hashing.
 """
 
 from datetime import datetime, timezone
@@ -12,12 +11,18 @@ from typing import Any, Dict, List, Optional
 from .base import PSXSourceAdapter, UpstreamResponse
 from ..budget import RequestBudgetManager
 from ..cooldown import CooldownManager, CircuitBreakerTrippedError
+from ..session_token import PSXTokenProvider
 from ..vendor.psx_dps.client import Client as DPSClient
 from ..vendor.psx_dps.errors import NoData, UnknownSymbol, UpstreamError, RateLimited
 from ..vendor.psx_dps import transport
 
 # Ensure reliable health probe route across PSX infrastructure
 transport.PROBE_PATH = os.environ.get("PSX_PROBE_PATH", "/indices")
+
+# Canonical ticker aliases on PSX (e.g. corporate mergers/restructurings)
+TICKER_ALIASES = {
+    "ENGRO": "ENGROH",
+}
 
 
 class PSXDPSAdapter(PSXSourceAdapter):
@@ -26,12 +31,14 @@ class PSXDPSAdapter(PSXSourceAdapter):
         cache_dir: Optional[str] = None,
         budget_manager: Optional[RequestBudgetManager] = None,
         cooldown_manager: Optional[CooldownManager] = None,
+        token_provider: Optional[PSXTokenProvider] = None,
         min_interval_seconds: float = 1.0,
         timeout_seconds: float = 15.0,
     ):
         super().__init__(source_name="psx-dps")
         self.budget_manager = budget_manager or RequestBudgetManager()
         self.cooldown_manager = cooldown_manager or CooldownManager()
+        self.token_provider = token_provider or PSXTokenProvider()
         self.min_interval_seconds = min_interval_seconds
         self.timeout_seconds = timeout_seconds
 
@@ -44,6 +51,7 @@ class PSXDPSAdapter(PSXSourceAdapter):
             retries=2,
             respect_cooldown=True,
         )
+        self.client.transport.token_provider = self.token_provider
 
     def _execute_bounded_call(self, endpoint_name: str, call_fn) -> UpstreamResponse:
         # 1. Circuit breaker preflight
@@ -87,7 +95,6 @@ class PSXDPSAdapter(PSXSourceAdapter):
             duration_ms = (time.time() - start_time) * 1000
             err_str = str(e)
             if "404" in err_str:
-                # 404 resource not found does not trip circuit breaker
                 self.cooldown_manager.record_error(status_code=404, reason=err_str)
             else:
                 self.cooldown_manager.record_error(status_code=503, retry_after=120, reason=err_str)
@@ -104,7 +111,6 @@ class PSXDPSAdapter(PSXSourceAdapter):
             try:
                 return self.client.symbols()
             except UpstreamError:
-                # Fall back to verified ALLSHR constituents (559 stocks)
                 constituents = self.client.index_constituents("ALLSHR")
                 return [
                     {
@@ -124,7 +130,6 @@ class PSXDPSAdapter(PSXSourceAdapter):
             try:
                 return self.client.snapshot()
             except UpstreamError:
-                # Derive market-wide snapshot from 559 constituents
                 constituents = self.client.index_constituents("ALLSHR")
                 rows = []
                 for c in constituents:
@@ -144,16 +149,22 @@ class PSXDPSAdapter(PSXSourceAdapter):
                 return {
                     "source": "psx-dps-allshr",
                     "captured_at": datetime.now(timezone.utc).isoformat(),
-                    "session": "CLOSED",
+                    "session": "ACTIVE_ALLSHR",
                     "rows": rows,
                 }
         return self._execute_bounded_call("snapshot", fetch)
 
     def get_eod(self, symbol: str) -> UpstreamResponse:
-        return self._execute_bounded_call(f"eod/{symbol}", lambda: self.client.eod(symbol))
+        target_symbol = TICKER_ALIASES.get(symbol.upper(), symbol.upper())
+        return self._execute_bounded_call(f"eod/{target_symbol}", lambda: self.client.eod(target_symbol))
 
     def get_indices(self) -> UpstreamResponse:
         return self._execute_bounded_call("indices", lambda: self.client.indices())
 
     def get_intraday(self, symbol: str) -> UpstreamResponse:
-        return self._execute_bounded_call(f"intraday/{symbol}", lambda: self.client.intraday(symbol))
+        target_symbol = TICKER_ALIASES.get(symbol.upper(), symbol.upper())
+        return self._execute_bounded_call(f"intraday/{target_symbol}", lambda: self.client.intraday(target_symbol))
+
+    def get_historical_date(self, trading_date: str) -> UpstreamResponse:
+        """Fetch market-wide historical daily bars for a specific date (POST /historical)."""
+        return self._execute_bounded_call(f"history_date/{trading_date}", lambda: self.client.history_by_date(trading_date))

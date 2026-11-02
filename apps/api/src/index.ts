@@ -11,6 +11,8 @@ import { verifyCloudflareAccess, verifyHmacSignature } from './middleware/auth';
 type Bindings = {
   DB?: D1Database;
   KV?: KVNamespace;
+  CLOUDFLARE_CLIENT_ID?: string;
+  CLOUDFLARE_CLIENT_SECRET?: string;
   CF_ACCESS_CLIENT_ID?: string;
   CF_ACCESS_CLIENT_SECRET?: string;
   INGEST_HMAC_SECRET?: string;
@@ -122,8 +124,8 @@ app.get('/v1/indices/:code', (c) => {
 // Protected Ingestion Endpoint (Requires Cloudflare Access token + HMAC)
 app.post('/v1/admin/ingest', async (c) => {
   const accessConfig = {
-    accessClientId: c.env?.CF_ACCESS_CLIENT_ID,
-    accessClientSecret: c.env?.CF_ACCESS_CLIENT_SECRET,
+    accessClientId: c.env?.CLOUDFLARE_CLIENT_ID || c.env?.CF_ACCESS_CLIENT_ID,
+    accessClientSecret: c.env?.CLOUDFLARE_CLIENT_SECRET || c.env?.CF_ACCESS_CLIENT_SECRET,
   };
 
   // 1. Verify Cloudflare Access
@@ -152,10 +154,127 @@ app.post('/v1/admin/ingest', async (c) => {
       return c.json({ error: 'Invalid Payload', issues: parsed.error.issues }, 400);
     }
 
+    const { manifest, bars, snapshot, indices, collectorRunId } = parsed.data;
+
+    // 4. Persist to D1 if DB binding available
+    if (c.env?.DB) {
+      const db = c.env.DB;
+      const statements: D1PreparedStatement[] = [];
+
+      // Record raw ingestion audit
+      statements.push(
+        db.prepare(
+          `INSERT OR REPLACE INTO raw_ingestions (ingestion_id, source, trading_date, sha256, archive_path, status, records_count, fetched_at_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          collectorRunId,
+          manifest.source,
+          manifest.tradingDate,
+          manifest.payloadSha256,
+          manifest.archivePath || null,
+          'ACCEPTED',
+          bars.length + (snapshot?.observations.length || 0),
+          manifest.generatedAtUtc
+        )
+      );
+
+      // Upsert daily bars
+      for (const bar of bars) {
+        statements.push(
+          db.prepare(
+            `INSERT OR REPLACE INTO daily_bars (source, symbol, trading_date, revision, open, high, low, close, volume, is_quarantined, quarantine_reason, payload_sha256, fetched_at_utc, is_active)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+          ).bind(
+            bar.source,
+            bar.symbol,
+            bar.tradingDate,
+            bar.revision,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            bar.isQuarantined ? 1 : 0,
+            bar.quarantineReason || null,
+            bar.hash,
+            bar.fetchedAtUtc
+          )
+        );
+      }
+
+      // Upsert snapshot if present
+      if (snapshot) {
+        statements.push(
+          db.prepare(
+            `INSERT OR REPLACE INTO snapshots (batch_id, source, trading_date, raw_sha256, symbols_count, fetched_at_utc, is_active)
+             VALUES (?, ?, ?, ?, ?, ?, 1)`
+          ).bind(
+            snapshot.batchId,
+            snapshot.source,
+            snapshot.tradingDate,
+            snapshot.rawSha256,
+            snapshot.totalSymbols,
+            snapshot.fetchedAtUtc
+          )
+        );
+
+        for (const obs of snapshot.observations) {
+          statements.push(
+            db.prepare(
+              `INSERT OR REPLACE INTO snapshot_observations (batch_id, symbol, current_price, change_value, change_percent, volume, high, low)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(
+              snapshot.batchId,
+              obs.symbol,
+              obs.current,
+              obs.change,
+              obs.changePercent,
+              obs.volume,
+              obs.high || null,
+              obs.low || null
+            )
+          );
+        }
+      }
+
+      // Upsert index history
+      for (const idx of indices) {
+        statements.push(
+          db.prepare(
+            `INSERT OR REPLACE INTO index_history (code, trading_date, current_value, change_value, change_percent, volume, fetched_at_utc)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            idx.code,
+            idx.tradingDate,
+            idx.current,
+            idx.change,
+            idx.changePercent,
+            idx.volume,
+            idx.fetchedAtUtc
+          )
+        );
+      }
+
+      // Execute batch (Cloudflare D1 supports max 100 statements per batch)
+      if (statements.length > 0) {
+        const chunkSize = 90;
+        for (let i = 0; i < statements.length; i += chunkSize) {
+          await db.batch(statements.slice(i, i + chunkSize));
+        }
+      }
+    }
+
+    // 5. Cache manifest in KV if KV binding available
+    if (c.env?.KV) {
+      await c.env.KV.put('latest_manifest', JSON.stringify(manifest));
+      await c.env.KV.put('last_ingest_utc', new Date().toISOString());
+    }
+
     return c.json({
       status: 'ACCEPTED',
-      batchId: parsed.data.collectorRunId,
-      processedBars: parsed.data.bars.length,
+      batchId: collectorRunId,
+      processedBars: bars.length,
+      processedSnapshotObservations: snapshot?.observations.length || 0,
       receivedAtUtc: new Date().toISOString(),
     });
   } catch (err: any) {

@@ -1,8 +1,11 @@
 # PSX Research Lab — System Architecture
 
-**Document Version:** 1.0.0 (Milestone 0 & 1)  
+**Document Version:** 1.2.0 (Milestone 2 Verified)  
 **Cost Posture:** Exactly \$0.00 / month (No credit-card dependencies, free tiers only)  
-**Topology:** 100% Cloud-Hosted (No always-on home Mac, Orange Pi, or VPS)
+**Topology:** 100% Cloud-Hosted (No always-on personal hardware, MacBook, Orange Pi, or VPS)  
+**Repository Model:** Dual-Repository Split:
+- **Application Repository (PUBLIC):** `MahadImran/psx-research-lab` (Code, architecture, CI workflows, tests, engineering portfolio showcase)
+- **Data Archive Repository (PRIVATE):** `MahadImran/psx-research-data` (Immutable compressed market data `.json.gz`, daily SHA-256 manifests, disaster recovery state)
 
 ---
 
@@ -10,42 +13,42 @@
 
 ```mermaid
 flowchart TD
-    subgraph GitHub_Cloud["GitHub Infrastructure (Free Private Repos)"]
-        GHA["GitHub Actions (Linux Runners, 2000 free min/mo)\n• Scheduled cron (market hours PKT)\n• Ephemeral Python collector\n• SHA-256 validation & quarantine\n• Atomic D1 lease check"]
-        DataRepo[("psx-research-data (Private)\n• Immutable raw .json.gz responses\n• Daily SHA-256 manifests\n• Nightly encrypted D1 exports")]
+    subgraph GitHub_Cloud["GitHub Infrastructure (Free Cloud Tier)"]
+        GHA["GitHub Actions (Linux Runners, 2000 free min/mo)\n• Scheduled cron (market hours PKT)\n• Ephemeral Python collector\n• MarketCalendar (Karachi time session gate)\n• PersistentCoordinator (250 req/24h fuse & lease)\n• QuarantineAuditor (Schema & price audit)\n• EODReconciler (Settlement vs intraday)"]
+        DataRepo[("MahadImran/psx-research-data (Strictly PRIVATE)\n• Immutable raw .json.gz responses (raw/YYYY/MM/DD/)\n• Daily SHA-256 manifests (manifests/YYYY-MM-DD.json)\n• Persistent cross-run lease & budget state")]
     end
 
     subgraph PSX_Upstream["Upstream Sources (Polite single collector)"]
-        PSXDPS["Primary: dps.psx.com.pk via psx-dps\n• Rate-limited (1 req/s)\n• 250 requests/24h safety fuse\n• Respects 429 Retry-After & 503"]
+        PSXDPS["Primary: dps.psx.com.pk via psx-dps\n• Rate-limited (1 req/s)\n• Session Token Provider (X-Req-Id via window.__ps._k)\n• 250 requests/24h safety fuse\n• Respects 429 Retry-After & 503"]
         PSXData["Secondary: psxdata (Fallback only)"]
     end
 
     subgraph Cloudflare_Free["Cloudflare Workers Free Tier"]
-        CF_Access["Cloudflare Access Free (Zero Trust)\nRestricts 100% staging hostname"]
-        Worker["Cloudflare Worker (<10ms CPU)\n• Ingest validation (HMAC + Access Token)\n• AI Gateway (Gemini 3.5 Flash Lite)\n• Static asset serving (<25MiB/file)"]
+        CF_Access["Cloudflare Access Free (Zero Trust)\nRestricts 100% staging hostname\nValidated via CLOUDFLARE_CLIENT_ID / SECRET"]
+        Worker["Cloudflare Worker (<10ms CPU)\n• Ingest validation (HMAC-SHA256 + Access Token)\n• AI Gateway (Gemini 3.5 Flash Lite)\n• Static asset serving (<25MiB/file)"]
         CF_Cron["Cloudflare Cron Watchdog\n• Minute 45 health monitor\n• Stale data badge triggers"]
-        D1[("Cloudflare D1 (<=500MB)\n• Canonical daily bars & revisions\n• Shared 24h request budget\n• Distributed collector leases\n• AI visitor quotas & rate limits")]
-        KV[("Cloudflare KV (<=1GB)\n• Latest whole-board snapshot\n• Fast immutable partitions")]
+        D1[("Cloudflare D1 (<=500MB)\n• Canonical daily bars & revisions\n• Snapshots & observations\n• Indices & raw ingestion audits\n• Shared 24h request budget\n• Distributed collector leases")]
+        KV[("Cloudflare KV (<=1GB)\n• Latest whole-board snapshot\n• Active manifest & health state")]
     end
 
     subgraph Client_Browser["Browser Client (Local Execution)"]
-        ReactUI["Financial Terminal UI\n• Real-time / Stale badge\n• Karachi Market Time display\n• Light/Dark high-density mode"]
+        ReactUI["Financial Terminal UI\n• Real-time / Stale badge\n• Karachi Market Time display\n• High-density light/dark mode"]
         WebWorker["Browser Web Worker\n• 100% Deterministic Backtesting\n• No AI math execution\n• Reproducible equity curves"]
     end
 
     subgraph Monitoring["External Free Observability"]
-        Healthchecks["Healthchecks.io (Hobbyist Free)\nMissed collection heartbeat"]
+        Healthchecks["Healthchecks.io (Hobbyist Free)\nStart, Success, Fail, Skip lifecycle pings"]
     end
 
     %% Flows
     GHA -->|"Polite fetch (<=250 req/24h)"| PSXDPS
     GHA -->|"Fallback (if normal failure)"| PSXData
-    GHA -->|"Commit compressed raw archives"| DataRepo
+    GHA -->|"Commit compressed raw archives (.json.gz)"| DataRepo
     GHA -->|"Ingest (HMAC + Access Token)"| CF_Access
     CF_Access --> Worker
     Worker --> D1
     Worker --> KV
-    GHA -->|"Ping heartbeat"| Healthchecks
+    GHA -->|"Lifecycle pings (/start, /fail, summary)"| Healthchecks
     CF_Cron -->|"Inspect latest timestamp"| D1
     ReactUI --> Worker
     ReactUI --> WebWorker
@@ -55,7 +58,30 @@ flowchart TD
 
 ## 2. Core Architectural Decisions
 
-1. **Single Owner Collector:** Only the ephemeral GitHub Actions runner runs Python and hits PSX endpoints. User request handlers never trigger scraping.
-2. **Ephemeral Runners & Data Durability:** GitHub Actions runners are destroyed upon completion. All raw data is gzipped and committed to the private `psx-research-data` repository with SHA-256 manifests before ingestion into Cloudflare D1.
-3. **Persistent Request Fuse:** A hard 250-request/24-hour limit is tracked in D1 and checked before every upstream request across all runners.
-4. **Deterministic Math:** Gemini AI strictly compiles natural language into a versioned JSON DSL (`ExperimentSpec`). The browser Web Worker executes all calculations deterministically.
+1. **Dual-Repository Separation:**
+   - The application codebase is intentionally public (`MahadImran/psx-research-lab`).
+   - The financial data archive is strictly private (`MahadImran/psx-research-data`).
+   - Under no circumstances does the public CI workflow leak private data archive tokens or raw third-party datasets into public build logs or artifacts.
+2. **Single-Owner Collector:** Only ephemeral GitHub Actions runners run Python and query PSX endpoints. Public API user requests never trigger scraping.
+3. **Session Token Extraction (`PSXTokenProvider`):**
+   - PSX requires `X-Req-Id` matching `window.__ps._k` and `X-Requested-With: XMLHttpRequest` on data endpoints since September 2026.
+   - The token is extracted and cached for 1 hour, enabling 100% reliable data access across all tested endpoints.
+4. **Market Trading Hours Awareness (`MarketCalendar`):**
+   - All market hours are evaluated in `Asia/Karachi` (PKT, UTC+5).
+   - Mon–Thu: 09:15–15:30 PKT.
+   - Friday: 09:15–12:00 PKT (Session 1), 14:30–16:30 PKT (Session 2).
+   - Post-close EOD reconciliation window: 15:30–18:00 PKT (16:30–19:00 on Fridays).
+   - Out-of-hours collector triggers ping Healthchecks with skip reasons and exit cleanly without consuming upstream requests.
+5. **Persistent Cross-Runner Coordination (`PersistentCoordinator`):**
+   - Ephemeral GitHub runners coordinate through state stored in the private data repository (`state/budget_and_lease.json`).
+   - A single-collector lease with a 300s TTL prevents overlapping runners.
+   - A rolling 24-hour request fuse strictly enforces the 250 requests/24h budget.
+6. **Immutable Durability (`DurableArchiveManager`):**
+   - All upstream responses are gzipped (level 9) and sharded by `raw/YYYY/MM/DD/{source}_{endpoint}_{timestamp}_{hash8}.json.gz`.
+   - Daily SHA-256 integrity manifests are committed to `manifests/YYYY-MM-DD.json`.
+7. **Settlement Reconciliation (`EODReconciler`):**
+   - Post-market daily reconciliation fetches official `POST /historical` datewise prices (712 symbols).
+   - Discrepancies between preliminary intraday quotes and final settlement prices are flagged as revisions (`revision = 1`) and audited.
+8. **Deterministic Client-Side Backtesting:**
+   - AI is treated strictly as a compiler from natural language to structured JSON DSL.
+   - Financial mathematics, portfolio accounting, and backtesting execute deterministically in the client's browser Web Worker.

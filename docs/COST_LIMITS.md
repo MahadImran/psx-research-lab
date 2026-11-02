@@ -44,3 +44,12 @@
   - Min Interval: 30 seconds.
   - Daily reset: Midnight `America/Los_Angeles` (aligned with Google RPD reset).
 - **Forbidden:** No automatic credit-card billing or paid fallback.
+
+---
+
+## 4. Healthchecks.io Free Tier Budget
+- **Plan:** Hobbyist ($0 / month).
+- **Checks:** 20 checks free (we consume 1 check: PSX Collector Heartbeat).
+- **Grace Period:** 45 minutes grace period.
+- **Alert Channel:** Email / webhook notifications.
+- **Fail-Open Policy:** If monitoring fails or reaches rate limits, collection continues unhindered.

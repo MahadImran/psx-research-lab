@@ -116,4 +116,69 @@ describe('API Routes & Security', () => {
     expect(data.status).toBe('ACCEPTED');
     expect(data.processedBars).toBe(1);
   });
+
+  it('POST /v1/admin/ingest validates Cloudflare Access service token headers', async () => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = 'valid-nonce-access';
+    const payload = {
+      manifest: {
+        manifestVersion: '1.0.0',
+        generatedAtUtc: new Date().toISOString(),
+        tradingDate: '2026-10-30',
+        source: 'psx-dps',
+        totalBars: 0,
+        totalSnapshots: 0,
+        totalIndices: 0,
+        payloadSha256: 'd'.repeat(64),
+      },
+      bars: [],
+      indices: [],
+      collectorRunId: 'test-run-cf-access',
+      timestamp,
+      nonce,
+    };
+    const body = JSON.stringify(payload);
+    const message = `${timestamp}.${nonce}.${body}`;
+    const sig = await computeHmac(message, 'dev-hmac-secret-only');
+
+    // 1. Missing CF-Access headers when env credentials configured
+    const mockEnv = {
+      CLOUDFLARE_CLIENT_ID: 'test-cf-client-id',
+      CLOUDFLARE_CLIENT_SECRET: 'test-cf-client-secret',
+      INGEST_HMAC_SECRET: 'dev-hmac-secret-only',
+    };
+
+    const resForbidden = await app.request(
+      '/v1/admin/ingest',
+      {
+        method: 'POST',
+        headers: {
+          'X-Ingest-Signature': sig,
+          'X-Ingest-Timestamp': timestamp.toString(),
+          'X-Ingest-Nonce': nonce,
+        },
+        body,
+      },
+      mockEnv
+    );
+    expect(resForbidden.status).toBe(403);
+
+    // 2. Presenting valid CF-Access headers
+    const resAllowed = await app.request(
+      '/v1/admin/ingest',
+      {
+        method: 'POST',
+        headers: {
+          'CF-Access-Client-Id': 'test-cf-client-id',
+          'CF-Access-Client-Secret': 'test-cf-client-secret',
+          'X-Ingest-Signature': sig,
+          'X-Ingest-Timestamp': timestamp.toString(),
+          'X-Ingest-Nonce': nonce,
+        },
+        body,
+      },
+      mockEnv
+    );
+    expect(resAllowed.status).toBe(200);
+  });
 });

@@ -62,6 +62,7 @@ class Transport:
         self.timeout = timeout
         self.retries = max(1, int(retries))
         self.user_agent = user_agent or USER_AGENT
+        self.token_provider = None
         self.state_dir = os.path.expanduser(state_dir or self.cache.dir)
         self.node_path = os.path.join(self.state_dir, "node.json")
         self._node = None
@@ -285,7 +286,12 @@ class Transport:
             # difference between tens of megabytes a day and a few.
             "Accept-Encoding": "gzip, deflate",
             "Referer": f"https://{HOST}/",
+            "X-Requested-With": "XMLHttpRequest",
         }
+        if self.token_provider:
+            token = self.token_provider.get_token()
+            if token:
+                headers["X-Req-Id"] = token
         payload = None
         if body is not None:
             from urllib.parse import urlencode

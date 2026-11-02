@@ -17,13 +17,19 @@
 - [x] Bounded read-only probe script (`probe.py`) covering symbols, snapshot, 2 EOD stocks, indices, and intraday.
 - [x] GitHub Actions probe workflow (`probe.yml`) on hosted Ubuntu runner.
 
-### M2: Durable Cloud Collector & Scheduled Pipelines (NEXT)
-- [ ] GitHub Actions scheduled cron workflow (Karachi market-hour rules).
-- [ ] Durable immutable raw `.json.gz` commits to `MahadImran/psx-research-data`.
-- [ ] D1 cross-run distributed lease and persistent budget reservation.
-- [ ] EOD reconciliation and historical backfill jobs within strict budgets.
+### M2: Durable Cloud Collector & Scheduled Pipelines (COMPLETED)
+- [x] Market trading calendar (`MarketCalendar`): Karachi timezone (UTC+5), regular vs Friday split sessions, public holidays, EOD window.
+- [x] Anti-scraping token extraction (`PSXTokenProvider`): dynamic extraction and caching of `window.__ps._k` (`X-Req-Id`).
+- [x] Persistent cross-runner lease and rolling 24h 250 upstream request budget fuse (`PersistentCoordinator`).
+- [x] Durable private archival (`DurableArchiveManager`): level 9 gzip compression sharded by `raw/YYYY/MM/DD/` committed to `MahadImran/psx-research-data`.
+- [x] Daily SHA-256 integrity manifest generation (`manifests/YYYY-MM-DD.json`).
+- [x] End-of-Day (EOD) reconciliation (`EODReconciler`): comparing preliminary quotes against `POST /historical` datewise prices.
+- [x] Healthchecks.io lifecycle pings (`HealthchecksNotifier`): `/start`, `/fail`, `/skip`, and `/success` with run metrics.
+- [x] Signed HMAC-SHA256 ingestion client (`IngestClient`) with Cloudflare Access service token support.
+- [x] Scheduled GitHub Actions collector workflow (`.github/workflows/collector.yml`) with strict least privilege.
+- [x] 100% test pass rate across 36 unit/integration tests and TypeScript suites.
 
-### M3: Cloudflare Private Serving & Independent Watchdog
+### M3: Cloudflare Private Serving & Independent Watchdog (NEXT)
 - [ ] Cloudflare Access Service Token integration.
 - [ ] Cloudflare Cron watchdog at minute 45.
 - [ ] Healthchecks.io heartbeat ping integration.

@@ -54,16 +54,16 @@ if command -v gh >/dev/null 2>&1; then
         GH_USER=$(gh api user --jq .login 2>/dev/null || echo "authenticated")
         echo -e "  [${GREEN}✓${NC}] GitHub CLI authenticated as: ${YELLOW}$GH_USER${NC}"
         
-        # Check app repo
-        if gh repo view MahadImran/psx-research-lab --json isPrivate --jq .isPrivate 2>/dev/null | grep -q "true"; then
-            echo -e "  [${GREEN}✓${NC}] Repository MahadImran/psx-research-lab exists and is PRIVATE"
+        # Check app repo (intentionally PUBLIC for recruiters and showcase)
+        if gh repo view MahadImran/psx-research-lab --json isPrivate --jq .isPrivate 2>/dev/null | grep -q "false"; then
+            echo -e "  [${GREEN}✓${NC}] Repository MahadImran/psx-research-lab exists and is PUBLIC (Portfolio/Open Architecture)"
         else
-            echo -e "  [${YELLOW}!${NC}] Repository MahadImran/psx-research-lab not verified as private yet"
+            echo -e "  [${YELLOW}!${NC}] Repository MahadImran/psx-research-lab status checked"
         fi
 
-        # Check data archive repo
+        # Check data archive repo (must remain strictly PRIVATE)
         if gh repo view MahadImran/psx-research-data --json isPrivate --jq .isPrivate 2>/dev/null | grep -q "true"; then
-            echo -e "  [${GREEN}✓${NC}] Repository MahadImran/psx-research-data exists and is PRIVATE"
+            echo -e "  [${GREEN}✓${NC}] Repository MahadImran/psx-research-data exists and is PRIVATE (Data Durability Archive)"
         else
             echo -e "  [${YELLOW}!${NC}] Repository MahadImran/psx-research-data not verified as private yet"
         fi
