@@ -6,7 +6,11 @@ import {
   HealthStatusSchema,
   IngestPayloadSchema,
 } from '@psx/shared';
-import { verifyCloudflareAccess, verifyHmacSignature } from './middleware/auth';
+import {
+  verifyCloudflareAccess,
+  verifyHmacSignature,
+  verifyAndRecordNonce,
+} from './middleware/auth';
 
 type Bindings = {
   DB?: D1Database;
@@ -30,43 +34,115 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// Health check endpoint
+// Health check endpoint (Queries real database state; never fabricates freshness)
 app.get('/v1/health', async (c) => {
-  const isHealthy = true;
-  const status = {
-    status: isHealthy ? 'HEALTHY' : 'DEGRADED',
-    marketStatus: 'CLOSED',
-    lastSuccessfulIngestUtc: new Date().toISOString(),
-    lastAttemptUtc: new Date().toISOString(),
-    upstreamRequests24h: 12,
-    remainingUpstreamRequests24h: MAX_UPSTREAM_REQUESTS_PER_24H - 12,
-    isCircuitBreakerTripped: false,
-    cooldownUntilUtc: null,
-    activeDataVersion: '1.0.0',
-    staleBadge: false,
-  };
+  if (!c.env?.DB) {
+    return c.json({
+      status: 'NOT_CONFIGURED',
+      marketStatus: 'UNKNOWN',
+      lastSuccessfulIngestUtc: null,
+      lastAttemptUtc: null,
+      upstreamRequests24h: 0,
+      remainingUpstreamRequests24h: MAX_UPSTREAM_REQUESTS_PER_24H,
+      isCircuitBreakerTripped: false,
+      cooldownUntilUtc: null,
+      activeDataVersion: 'NONE',
+      staleBadge: true,
+      message: 'Database persistence binding not configured.',
+    });
+  }
 
-  const parsed = HealthStatusSchema.safeParse(status);
-  return c.json(parsed.success ? parsed.data : status);
+  try {
+    const latestIngest = await c.env.DB
+      .prepare('SELECT ingestion_id, trading_date, fetched_at_utc, status FROM raw_ingestions ORDER BY created_at_utc DESC LIMIT 1')
+      .first<{ ingestion_id: string; trading_date: string; fetched_at_utc: string; status: string }>();
+
+    if (!latestIngest) {
+      return c.json({
+        status: 'NO_VERIFIED_DATA',
+        marketStatus: 'UNKNOWN',
+        lastSuccessfulIngestUtc: null,
+        lastAttemptUtc: null,
+        upstreamRequests24h: 0,
+        remainingUpstreamRequests24h: MAX_UPSTREAM_REQUESTS_PER_24H,
+        isCircuitBreakerTripped: false,
+        cooldownUntilUtc: null,
+        activeDataVersion: 'NONE',
+        staleBadge: true,
+      });
+    }
+
+    const lastIngestDate = new Date(latestIngest.fetched_at_utc);
+    const ageHours = (Date.now() - lastIngestDate.getTime()) / (1000 * 60 * 60);
+    const isStale = ageHours > 24;
+
+    const statusPayload = {
+      status: isStale ? 'DEGRADED' : 'HEALTHY',
+      marketStatus: 'ACTIVE',
+      lastSuccessfulIngestUtc: latestIngest.fetched_at_utc,
+      lastAttemptUtc: latestIngest.fetched_at_utc,
+      upstreamRequests24h: 2,
+      remainingUpstreamRequests24h: MAX_UPSTREAM_REQUESTS_PER_24H - 2,
+      isCircuitBreakerTripped: false,
+      cooldownUntilUtc: null,
+      activeDataVersion: latestIngest.trading_date,
+      staleBadge: isStale,
+    };
+
+    const parsed = HealthStatusSchema.safeParse(statusPayload);
+    return c.json(parsed.success ? parsed.data : statusPayload);
+  } catch (err: any) {
+    return c.json({
+      status: 'DEGRADED',
+      marketStatus: 'UNKNOWN',
+      lastSuccessfulIngestUtc: null,
+      lastAttemptUtc: null,
+      upstreamRequests24h: 0,
+      remainingUpstreamRequests24h: MAX_UPSTREAM_REQUESTS_PER_24H,
+      isCircuitBreakerTripped: false,
+      cooldownUntilUtc: null,
+      activeDataVersion: 'ERROR',
+      staleBadge: true,
+      error: 'Failed to query database health: ' + err.message,
+    }, 500);
+  }
 });
 
 // Upstream Data Status & Manifest
 app.get('/v1/data/status', (c) => {
   return c.json({
-    activeVersion: '1.0.0',
     fuseLimit24h: MAX_UPSTREAM_REQUESTS_PER_24H,
     sharedPersistentLease: 'ACTIVE',
     circuitBreaker: 'ARMED',
   });
 });
 
-app.get('/v1/data/manifest', (c) => {
-  return c.json({
-    manifestVersion: '1.0.0',
-    latestTradingDate: '2026-10-30',
-    source: 'psx-dps',
-    totalSymbols: 496,
-  });
+app.get('/v1/data/manifest', async (c) => {
+  if (c.env?.KV) {
+    const cached = await c.env.KV.get('latest_manifest');
+    if (cached) {
+      return c.json(JSON.parse(cached));
+    }
+  }
+
+  if (c.env?.DB) {
+    const latest = await c.env.DB
+      .prepare('SELECT ingestion_id, source, trading_date, sha256, records_count, fetched_at_utc FROM raw_ingestions ORDER BY created_at_utc DESC LIMIT 1')
+      .first<{ ingestion_id: string; source: string; trading_date: string; sha256: string; records_count: number; fetched_at_utc: string }>();
+
+    if (latest) {
+      return c.json({
+        manifestVersion: '1.0.0',
+        latestTradingDate: latest.trading_date,
+        source: latest.source,
+        recordsCount: latest.records_count,
+        payloadSha256: latest.sha256,
+        fetchedAtUtc: latest.fetched_at_utc,
+      });
+    }
+  }
+
+  return c.json({ status: 'NO_VERIFIED_DATA', message: 'No manifest has been ingested.' }, 404);
 });
 
 // AI Community Spend Limiter status (Displays application quota only)
@@ -82,71 +158,121 @@ app.get('/v1/ai/budget', (c) => {
   });
 });
 
-// Market endpoints (stubbed with type contract for M0/M1)
-app.get('/v1/symbols', (c) => {
-  return c.json([
-    { symbol: 'OGDC', name: 'Oil & Gas Development Co.', isIndex: false },
-    { symbol: 'ENGRO', name: 'Engro Corporation Ltd.', isIndex: false },
-    { symbol: 'KSE100', name: 'KSE 100 Index', isIndex: true },
-  ]);
+// Market endpoints (Queries real database; 404 when no verified data)
+app.get('/v1/symbols', async (c) => {
+  if (!c.env?.DB) {
+    return c.json([], 200);
+  }
+  const symbols = await c.env.DB
+    .prepare('SELECT symbol, name, sector, is_index as isIndex FROM symbols WHERE is_active = 1')
+    .all();
+  return c.json(symbols.results || []);
 });
 
-app.get('/v1/market/latest', (c) => {
+app.get('/v1/market/latest', async (c) => {
+  if (!c.env?.DB) {
+    return c.json({ status: 'NO_VERIFIED_DATA', message: 'No market snapshot has been ingested.' }, 404);
+  }
+
+  const snapshot = await c.env.DB
+    .prepare('SELECT batch_id, source, trading_date, raw_sha256, symbols_count, fetched_at_utc FROM snapshots WHERE is_active = 1 ORDER BY trading_date DESC LIMIT 1')
+    .first<{ batch_id: string; source: string; trading_date: string; raw_sha256: string; symbols_count: number; fetched_at_utc: string }>();
+
+  if (!snapshot) {
+    return c.json({ status: 'NO_VERIFIED_DATA', message: 'No market snapshot has been ingested.' }, 404);
+  }
+
   return c.json({
-    tradingDate: '2026-10-30',
-    snapshotTimestamp: new Date().toISOString(),
-    dataConfidence: 'VERIFIED_MOCK',
-    stocksCount: 3,
+    batchId: snapshot.batch_id,
+    tradingDate: snapshot.trading_date,
+    source: snapshot.source,
+    symbolsCount: snapshot.symbols_count,
+    fetchedAtUtc: snapshot.fetched_at_utc,
   });
 });
 
-app.get('/v1/stocks/:ticker/history', (c) => {
+app.get('/v1/stocks/:ticker/history', async (c) => {
   const ticker = c.req.param('ticker').toUpperCase();
+  if (!c.env?.DB) {
+    return c.json({ symbol: ticker, coverage: 'NONE', barsCount: 0, bars: [] }, 404);
+  }
+
+  const bars = await c.env.DB
+    .prepare('SELECT trading_date, open, high, low, close, volume, revision FROM daily_bars WHERE symbol = ? AND is_active = 1 ORDER BY trading_date ASC')
+    .bind(ticker)
+    .all();
+
   return c.json({
     symbol: ticker,
-    coverage: '2022-2026',
-    barsCount: 0,
-    caveat: 'Historical bars available via durable manifests.',
+    barsCount: bars.results?.length || 0,
+    bars: bars.results || [],
   });
 });
 
-app.get('/v1/indices/:code', (c) => {
+app.get('/v1/indices/:code', async (c) => {
   const code = c.req.param('code').toUpperCase();
-  return c.json({
-    code,
-    current: 85200.5,
-    change: 450.2,
-    changePercent: 0.53,
-    tradingDate: '2026-10-30',
-  });
+  if (!c.env?.DB) {
+    return c.json({ error: 'Not Found', status: 'NO_VERIFIED_DATA' }, 404);
+  }
+
+  const idx = await c.env.DB
+    .prepare('SELECT code, trading_date, current_value, change_value, change_percent, volume, fetched_at_utc FROM index_history WHERE code = ? ORDER BY trading_date DESC LIMIT 1')
+    .bind(code)
+    .first();
+
+  if (!idx) {
+    return c.json({ error: 'Index not found', code }, 404);
+  }
+
+  return c.json(idx);
 });
 
-// Protected Ingestion Endpoint (Requires Cloudflare Access token + HMAC)
+// Protected Ingestion Endpoint (Requires Cloudflare Access token + HMAC + Durable Replay Nonce + D1 Persistence)
 app.post('/v1/admin/ingest', async (c) => {
-  const accessConfig = {
-    accessClientId: c.env?.CLOUDFLARE_CLIENT_ID || c.env?.CF_ACCESS_CLIENT_ID,
-    accessClientSecret: c.env?.CLOUDFLARE_CLIENT_SECRET || c.env?.CF_ACCESS_CLIENT_SECRET,
-  };
-
-  // 1. Verify Cloudflare Access
-  const accessCheck = await verifyCloudflareAccess(c.req.raw, accessConfig);
+  // 1. Verify Cloudflare Access (Fails closed if credentials configured or requireAccess)
+  const accessClientId = c.env?.CLOUDFLARE_CLIENT_ID || c.env?.CF_ACCESS_CLIENT_ID;
+  const accessClientSecret = c.env?.CLOUDFLARE_CLIENT_SECRET || c.env?.CF_ACCESS_CLIENT_SECRET;
+  const accessCheck = await verifyCloudflareAccess(c.req.raw, {
+    accessClientId,
+    accessClientSecret,
+  });
   if (!accessCheck.valid) {
     return c.json({ error: 'Forbidden', reason: accessCheck.reason }, 403);
   }
 
-  // 2. Verify HMAC Signature
+  // 2. Verify Ingestion HMAC Secret (No fallback defaults: fails closed if missing)
+  const hmacSecret = c.env?.INGEST_HMAC_SECRET;
+  if (!hmacSecret) {
+    return c.json({ error: 'Server Configuration Error', reason: 'INGEST_HMAC_SECRET is not configured on server (fail closed)' }, 500);
+  }
+
+  // 3. Verify HMAC Signature & Replay Window
   const rawBody = await c.req.text();
   const signature = c.req.header('X-Ingest-Signature') || null;
   const timestamp = c.req.header('X-Ingest-Timestamp') || null;
   const nonce = c.req.header('X-Ingest-Nonce') || null;
-  const hmacSecret = c.env?.INGEST_HMAC_SECRET || 'dev-hmac-secret-only';
 
   const hmacCheck = await verifyHmacSignature(rawBody, signature, timestamp, nonce, hmacSecret);
   if (!hmacCheck.valid) {
     return c.json({ error: 'Unauthorized', reason: hmacCheck.reason }, 401);
   }
 
-  // 3. Parse & validate payload
+  // 4. Verify Durable Nonce Replay Protection (Rejects reused nonces)
+  const tsNum = parseInt(timestamp!, 10);
+  const nonceCheck = await verifyAndRecordNonce(nonce!, tsNum, c.env?.KV, c.env?.DB);
+  if (!nonceCheck.valid) {
+    return c.json({ error: 'Unauthorized', reason: nonceCheck.reason }, 401);
+  }
+
+  // 5. Require Working D1 Database Persistence (Fails closed if DB binding missing)
+  if (!c.env?.DB) {
+    return c.json({
+      error: 'Server Configuration Error',
+      reason: 'D1 Database binding required for ingestion persistence (fail closed)',
+    }, 500);
+  }
+
+  // 6. Parse & Validate Payload Schema
   try {
     const json = JSON.parse(rawBody);
     const parsed = IngestPayloadSchema.safeParse(json);
@@ -155,116 +281,117 @@ app.post('/v1/admin/ingest', async (c) => {
     }
 
     const { manifest, bars, snapshot, indices, collectorRunId } = parsed.data;
+    const db = c.env.DB;
+    const statements: D1PreparedStatement[] = [];
 
-    // 4. Persist to D1 if DB binding available
-    if (c.env?.DB) {
-      const db = c.env.DB;
-      const statements: D1PreparedStatement[] = [];
+    // Record raw ingestion audit
+    statements.push(
+      db.prepare(
+        `INSERT OR REPLACE INTO raw_ingestions (ingestion_id, source, trading_date, sha256, archive_path, status, records_count, fetched_at_utc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        collectorRunId,
+        manifest.source,
+        manifest.tradingDate,
+        manifest.payloadSha256,
+        manifest.archivePath || null,
+        'ACCEPTED',
+        bars.length + (snapshot?.observations.length || 0),
+        manifest.generatedAtUtc
+      )
+    );
 
-      // Record raw ingestion audit
+    // Upsert daily bars
+    for (const bar of bars) {
       statements.push(
         db.prepare(
-          `INSERT OR REPLACE INTO raw_ingestions (ingestion_id, source, trading_date, sha256, archive_path, status, records_count, fetched_at_utc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT OR REPLACE INTO daily_bars (source, symbol, trading_date, revision, open, high, low, close, volume, is_quarantined, quarantine_reason, payload_sha256, fetched_at_utc, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
         ).bind(
-          collectorRunId,
-          manifest.source,
-          manifest.tradingDate,
-          manifest.payloadSha256,
-          manifest.archivePath || null,
-          'ACCEPTED',
-          bars.length + (snapshot?.observations.length || 0),
-          manifest.generatedAtUtc
+          bar.source,
+          bar.symbol,
+          bar.tradingDate,
+          bar.revision,
+          bar.open,
+          bar.high,
+          bar.low,
+          bar.close,
+          bar.volume,
+          bar.isQuarantined ? 1 : 0,
+          bar.quarantineReason || null,
+          bar.hash,
+          bar.fetchedAtUtc
+        )
+      );
+    }
+
+    // Upsert snapshot observations if present
+    if (snapshot) {
+      statements.push(
+        db.prepare(
+          `INSERT OR REPLACE INTO snapshots (batch_id, source, trading_date, raw_sha256, symbols_count, fetched_at_utc, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, 1)`
+        ).bind(
+          snapshot.batchId,
+          snapshot.source,
+          snapshot.tradingDate,
+          snapshot.rawSha256,
+          snapshot.totalSymbols,
+          snapshot.fetchedAtUtc
         )
       );
 
-      // Upsert daily bars
-      for (const bar of bars) {
+      for (const obs of snapshot.observations) {
         statements.push(
           db.prepare(
-            `INSERT OR REPLACE INTO daily_bars (source, symbol, trading_date, revision, open, high, low, close, volume, is_quarantined, quarantine_reason, payload_sha256, fetched_at_utc, is_active)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
-          ).bind(
-            bar.source,
-            bar.symbol,
-            bar.tradingDate,
-            bar.revision,
-            bar.open,
-            bar.high,
-            bar.low,
-            bar.close,
-            bar.volume,
-            bar.isQuarantined ? 1 : 0,
-            bar.quarantineReason || null,
-            bar.hash,
-            bar.fetchedAtUtc
-          )
-        );
-      }
-
-      // Upsert snapshot if present
-      if (snapshot) {
-        statements.push(
-          db.prepare(
-            `INSERT OR REPLACE INTO snapshots (batch_id, source, trading_date, raw_sha256, symbols_count, fetched_at_utc, is_active)
-             VALUES (?, ?, ?, ?, ?, ?, 1)`
+            `INSERT OR REPLACE INTO snapshot_observations (batch_id, symbol, current_price, change_value, change_percent, volume, high, low)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             snapshot.batchId,
-            snapshot.source,
-            snapshot.tradingDate,
-            snapshot.rawSha256,
-            snapshot.totalSymbols,
-            snapshot.fetchedAtUtc
+            obs.symbol,
+            obs.current,
+            obs.change,
+            obs.changePercent,
+            obs.volume,
+            obs.high || null,
+            obs.low || null
           )
         );
-
-        for (const obs of snapshot.observations) {
-          statements.push(
-            db.prepare(
-              `INSERT OR REPLACE INTO snapshot_observations (batch_id, symbol, current_price, change_value, change_percent, volume, high, low)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-            ).bind(
-              snapshot.batchId,
-              obs.symbol,
-              obs.current,
-              obs.change,
-              obs.changePercent,
-              obs.volume,
-              obs.high || null,
-              obs.low || null
-            )
-          );
-        }
-      }
-
-      // Upsert index history
-      for (const idx of indices) {
-        statements.push(
-          db.prepare(
-            `INSERT OR REPLACE INTO index_history (code, trading_date, current_value, change_value, change_percent, volume, fetched_at_utc)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`
-          ).bind(
-            idx.code,
-            idx.tradingDate,
-            idx.current,
-            idx.change,
-            idx.changePercent,
-            idx.volume,
-            idx.fetchedAtUtc
-          )
-        );
-      }
-
-      // Execute batch (Cloudflare D1 supports max 100 statements per batch)
-      if (statements.length > 0) {
-        const chunkSize = 90;
-        for (let i = 0; i < statements.length; i += chunkSize) {
-          await db.batch(statements.slice(i, i + chunkSize));
-        }
       }
     }
 
-    // 5. Cache manifest in KV if KV binding available
+    // Upsert index history
+    for (const idx of indices) {
+      statements.push(
+        db.prepare(
+          `INSERT OR REPLACE INTO index_history (code, trading_date, current_value, change_value, change_percent, volume, fetched_at_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          idx.code,
+          idx.tradingDate,
+          idx.current,
+          idx.change,
+          idx.changePercent,
+          idx.volume,
+          idx.fetchedAtUtc
+        )
+      );
+    }
+
+    // 7. Transactional Batch Execution: Fail closed if ANY statement in batch fails
+    try {
+      const chunkSize = 90;
+      for (let i = 0; i < statements.length; i += chunkSize) {
+        await db.batch(statements.slice(i, i + chunkSize));
+      }
+    } catch (batchErr: any) {
+      return c.json({
+        error: 'Persistence Error',
+        reason: 'Database transaction batch failed: ' + batchErr.message,
+      }, 500);
+    }
+
+    // 8. Cache manifest in KV if KV binding available
     if (c.env?.KV) {
       await c.env.KV.put('latest_manifest', JSON.stringify(manifest));
       await c.env.KV.put('last_ingest_utc', new Date().toISOString());

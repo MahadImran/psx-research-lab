@@ -2,6 +2,8 @@
 Durable Market Data Archival Engine.
 Persists immutable compressed responses (.json.gz) and integrity manifests
 into the private GitHub archive repository (MahadImran/psx-research-data).
+Includes automatic readback verification and idempotent recovery.
+Fails closed: never accepts ephemeral local storage as proof of durable archive in CI/production.
 """
 
 from datetime import datetime, timezone
@@ -12,12 +14,19 @@ import json
 import logging
 import os
 import urllib.request
+import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class ArchiveCommitError(Exception):
+    """Raised when committing to or verifying from remote archive fails."""
+    pass
+
+
+class ArchiveCredentialsError(Exception):
+    """Raised when DATA_REPO_TOKEN is missing in a production/CI environment."""
     pass
 
 
@@ -27,16 +36,24 @@ class DurableArchiveManager:
         repo_name: str = "MahadImran/psx-research-data",
         token: Optional[str] = None,
         local_archive_dir: Optional[str] = None,
+        require_remote: Optional[bool] = None,
     ):
         self.repo_name = repo_name
         self.token = token or os.environ.get("DATA_REPO_TOKEN")
         self.local_archive_dir = local_archive_dir or os.path.expanduser("~/.psx_local_archive")
+        self.require_remote = (
+            require_remote
+            if require_remote is not None
+            else bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI") or os.environ.get("REQUIRE_REMOTE_ARCHIVE"))
+        )
 
     @staticmethod
     def compute_sha256(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
     def _get_headers(self) -> Dict[str, str]:
+        if not self.token:
+            raise ArchiveCredentialsError("DATA_REPO_TOKEN is required to communicate with archive repository.")
         return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github.v3+json",
@@ -66,7 +83,7 @@ class DurableArchiveManager:
         filename = f"{source}_{safe_endpoint}_{timestamp_slug}_{sha256_hash[:8]}.json.gz"
         rel_path = f"raw/{year}/{month}/{day}/{filename}"
 
-        # Write to local staging if local dir enabled
+        # Write to local staging
         full_local = os.path.join(self.local_archive_dir, rel_path)
         os.makedirs(os.path.dirname(full_local), exist_ok=True)
         with open(full_local, "wb") as f:
@@ -74,17 +91,64 @@ class DurableArchiveManager:
 
         return rel_path, compressed, sha256_hash, len(raw_json)
 
-    def commit_file_to_archive(self, rel_path: str, content_bytes: bytes, commit_message: str) -> bool:
-        """Commits file to the private GitHub repository via GitHub REST API."""
+    def read_remote_file(self, rel_path: str) -> Tuple[Optional[bytes], Optional[str]]:
+        """
+        Reads a file back from the archive repository.
+        Returns: (content_bytes, file_sha) or (None, None) if not found.
+        """
         if not self.token:
-            logger.info("DATA_REPO_TOKEN not present; file persisted to local staging: %s", rel_path)
+            if self.require_remote:
+                raise ArchiveCredentialsError("DATA_REPO_TOKEN required to read from remote archive.")
+            full_local = os.path.join(self.local_archive_dir, rel_path)
+            if os.path.exists(full_local):
+                with open(full_local, "rb") as f:
+                    return f.read(), "local-sha"
+            return None, None
+
+        url = f"https://api.github.com/repos/{self.repo_name}/contents/{rel_path}"
+        try:
+            req = urllib.request.Request(url, headers=self._get_headers())
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                file_sha = data.get("sha")
+                raw_bytes = base64.b64decode(data.get("content", ""))
+                return raw_bytes, file_sha
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None, None
+            raise ArchiveCommitError(f"Error reading back {rel_path} from archive (HTTP {e.code})")
+        except Exception as e:
+            raise ArchiveCommitError(f"Network error reading back {rel_path}: {e}")
+
+    def commit_file_to_archive(self, rel_path: str, content_bytes: bytes, commit_message: str) -> bool:
+        """
+        Commits file to the private GitHub repository and verifies bit-for-bit readback integrity.
+        Handles idempotent updates if the file already exists.
+        Fails closed in CI/production if credentials are missing or commit/readback fails.
+        """
+        if not self.token:
+            if self.require_remote:
+                raise ArchiveCredentialsError(
+                    f"DATA_REPO_TOKEN required in CI/production! Cannot commit {rel_path} to ephemeral storage only."
+                )
+            logger.info("Local dev mode: staged %s locally without remote push", rel_path)
             return True
+
+        # Check existing remote file for idempotency
+        existing_bytes, existing_sha = self.read_remote_file(rel_path)
+        if existing_bytes is not None:
+            if existing_bytes == content_bytes:
+                logger.info("File already durably archived with identical content: %s", rel_path)
+                return True
+            logger.info("File exists with different content; updating: %s", rel_path)
 
         url = f"https://api.github.com/repos/{self.repo_name}/contents/{rel_path}"
         payload = {
             "message": commit_message,
             "content": base64.b64encode(content_bytes).decode("utf-8"),
         }
+        if existing_sha:
+            payload["sha"] = existing_sha
 
         try:
             req = urllib.request.Request(
@@ -94,21 +158,37 @@ class DurableArchiveManager:
                 method="PUT",
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status in (200, 201):
-                    logger.info("Successfully persisted to archive repo: %s", rel_path)
-                    return True
-                raise ArchiveCommitError(f"GitHub returned HTTP {resp.status} for {rel_path}")
+                if resp.status not in (200, 201):
+                    raise ArchiveCommitError(f"GitHub returned HTTP {resp.status} for {rel_path}")
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
-            logger.error("Failed to commit %s to archive: %s %s", rel_path, e.code, err_body)
-            raise ArchiveCommitError(f"Archive commit failed (HTTP {e.code}): {err_body}")
+            logger.error("Failed to commit %s to archive: HTTP %s %s", rel_path, e.code, err_body)
+            raise ArchiveCommitError(f"Archive commit failed for {rel_path} (HTTP {e.code}): {err_body}")
+        except Exception as e:
+            logger.error("Network error committing %s to archive: %s", rel_path, e)
+            raise ArchiveCommitError(f"Network error committing {rel_path}: {e}")
+
+        # READBACK VERIFICATION
+        readback_bytes, _ = self.read_remote_file(rel_path)
+        if readback_bytes is None:
+            raise ArchiveCommitError(f"Readback verification failed: file {rel_path} not found after commit!")
+        if readback_bytes != content_bytes:
+            raise ArchiveCommitError(
+                f"Readback verification hash mismatch for {rel_path}! (size committed: {len(content_bytes)}, size read: {len(readback_bytes)})"
+            )
+
+        logger.info("Durable archive committed and verified: %s (%d bytes)", rel_path, len(content_bytes))
+        return True
 
     def commit_daily_manifest(
         self,
         trading_date: str,
         manifest_data: Dict[str, Any]
     ) -> str:
-        """Commits the daily SHA-256 integrity manifest to manifests/{trading_date}.json."""
+        """
+        Commits daily SHA-256 integrity manifest to manifests/{trading_date}.json
+        with readback verification.
+        """
         manifest_bytes = json.dumps(manifest_data, indent=2, sort_keys=True).encode("utf-8")
         rel_path = f"manifests/{trading_date}.json"
 
@@ -118,10 +198,11 @@ class DurableArchiveManager:
         with open(full_local, "wb") as f:
             f.write(manifest_bytes)
 
-        if self.token:
+        if self.token or self.require_remote:
             self.commit_file_to_archive(
                 rel_path=rel_path,
                 content_bytes=manifest_bytes,
                 commit_message=f"chore(manifest): daily integrity manifest for {trading_date}",
             )
+
         return rel_path

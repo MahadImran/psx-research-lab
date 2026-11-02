@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
 from collector.adapters.base import UpstreamResponse
-from collector.archive import DurableArchiveManager
+from collector.archive import DurableArchiveManager, ArchiveCommitError
 from collector.healthchecks import HealthchecksNotifier
 from collector.ingest_client import IngestClient
 from collector.persistent_budget import PersistentCoordinator, LeaseConflictError
@@ -20,7 +20,7 @@ def test_pipeline_skips_when_market_closed():
     with patch("collector.calendar.MarketCalendar.should_scheduled_collector_run", return_value=(False, "Market closed (WEEKEND)")):
         with patch.object(pipeline.healthchecks, "ping_skip") as mock_skip:
             res = pipeline.run(force=False)
-            assert res["status"] == "SKIPPED"
+            assert res["status"] == "MARKET_CLOSED"
             assert "WEEKEND" in res["reason"]
             mock_skip.assert_called_once()
 
@@ -72,6 +72,7 @@ def test_pipeline_full_run_with_fixtures(tmp_path):
     )
 
     mock_ingest = MagicMock()
+    mock_ingest.api_url = "https://api.psxresearchlab.com"
     mock_ingest.send_ingestion.return_value = (True, 200, {"status": "ACCEPTED"})
 
     pipeline = CollectorPipeline(
@@ -87,10 +88,10 @@ def test_pipeline_full_run_with_fixtures(tmp_path):
 
         res = pipeline.run(force=True, dry_run=False)
 
-        assert res["status"] == "SUCCESS"
+        assert res["status"] == "FULLY_SUCCESSFUL_CYCLE"
         assert res["snapshotSymbolsCount"] == 2
         assert res["indicesCount"] == 1
-        assert res["ingestSuccess"] is True
+        assert res["ingestStatus"] == "ACCEPTED"
         assert len(res["archivedFiles"]) == 2
 
         mock_start.assert_called_once()
@@ -100,3 +101,86 @@ def test_pipeline_full_run_with_fixtures(tmp_path):
         # Check lease was released in finally
         state = mock_coordinator.load_remote_state()
         assert state.get("lease") is None
+
+
+def test_pipeline_fails_closed_on_archive_failure(tmp_path):
+    archive_dir = str(tmp_path / "archive")
+    state_file = str(tmp_path / "state.json")
+
+    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250)
+    mock_archive = MagicMock()
+    mock_archive.stage_locally.return_value = ("raw/2026/11/02/file.json.gz", b"fake", "hash", 100)
+    mock_archive.commit_file_to_archive.side_effect = ArchiveCommitError("Remote git commit failed (HTTP 500)")
+
+    mock_hc = HealthchecksNotifier(ping_url="https://hc-ping.com/test-uuid")
+
+    mock_adapter = MagicMock()
+    mock_adapter.get_snapshot.return_value = UpstreamResponse(
+        source="psx-dps",
+        endpoint="snapshot",
+        data={"rows": [{"symbol": "OGDC", "current": 136.0, "volume": 100}]},
+        raw_sha256="a" * 64,
+        record_count=1,
+        duration_ms=20.0,
+        status_code=200,
+    )
+
+    pipeline = CollectorPipeline(
+        adapter=mock_adapter,
+        coordinator=mock_coordinator,
+        archive_manager=mock_archive,
+        healthchecks=mock_hc,
+    )
+
+    with patch.object(mock_hc, "ping_fail") as mock_fail:
+        res = pipeline.run(force=True, dry_run=False)
+        assert res["status"] == "ARCHIVE_FAILED"
+        assert "Remote git commit failed" in res["error"]
+        mock_fail.assert_called_once()
+
+
+def test_pipeline_reports_ingest_failure(tmp_path):
+    archive_dir = str(tmp_path / "archive")
+    state_file = str(tmp_path / "state.json")
+
+    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250)
+    mock_archive = DurableArchiveManager(token=None, local_archive_dir=archive_dir)
+    mock_hc = HealthchecksNotifier(ping_url="https://hc-ping.com/test-uuid")
+
+    mock_adapter = MagicMock()
+    mock_adapter.get_snapshot.return_value = UpstreamResponse(
+        source="psx-dps",
+        endpoint="snapshot",
+        data={"rows": [{"symbol": "OGDC", "current": 136.0, "volume": 100}]},
+        raw_sha256="a" * 64,
+        record_count=1,
+        duration_ms=20.0,
+        status_code=200,
+    )
+    mock_adapter.get_indices.return_value = UpstreamResponse(
+        source="psx-dps",
+        endpoint="indices",
+        data=[],
+        raw_sha256="b" * 64,
+        record_count=0,
+        duration_ms=10.0,
+        status_code=200,
+    )
+
+    mock_ingest = MagicMock()
+    mock_ingest.api_url = "https://api.psxresearchlab.com"
+    mock_ingest.send_ingestion.return_value = (False, 401, {"reason": "HMAC signature failed"})
+
+    pipeline = CollectorPipeline(
+        adapter=mock_adapter,
+        coordinator=mock_coordinator,
+        archive_manager=mock_archive,
+        healthchecks=mock_hc,
+        ingest_client=mock_ingest,
+    )
+
+    with patch.object(mock_hc, "ping_fail") as mock_fail:
+        res = pipeline.run(force=True, dry_run=False)
+        assert res["status"] == "INGEST_FAILED"
+        assert res["httpStatus"] == 401
+        mock_fail.assert_called_once()

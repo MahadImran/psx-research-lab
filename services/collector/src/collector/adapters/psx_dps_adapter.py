@@ -52,6 +52,8 @@ class PSXDPSAdapter(PSXSourceAdapter):
             respect_cooldown=True,
         )
         self.client.transport.token_provider = self.token_provider
+        self.client.transport.budget_recorder = self.budget_manager
+        self.token_provider.budget_recorder = self.budget_manager
 
     def _execute_bounded_call(self, endpoint_name: str, call_fn) -> UpstreamResponse:
         # 1. Circuit breaker preflight

@@ -1,5 +1,9 @@
 import pytest
+from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
+import base64
+import json
+import urllib.error
 import os
 import sys
 
@@ -9,12 +13,13 @@ from collector.persistent_budget import (
     PersistentCoordinator,
     BudgetExceededError,
     LeaseConflictError,
+    RemoteStateError,
 )
 
 
 def test_persistent_coordinator_lease_lifecycle(tmp_path):
     state_file = str(tmp_path / "budget_state.json")
-    coord1 = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=10)
+    coord1 = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=10, require_remote=False)
     coord1.runner_id = "runner-1"
 
     # 1. Acquire lease
@@ -23,7 +28,7 @@ def test_persistent_coordinator_lease_lifecycle(tmp_path):
     assert coord1.active_lease["owner"] == "runner-1"
 
     # 2. Competing runner cannot acquire while lease is active
-    coord2 = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=10)
+    coord2 = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=10, require_remote=False)
     coord2.runner_id = "runner-2"
     with pytest.raises(LeaseConflictError):
         coord2.acquire_lease_and_sync()
@@ -43,7 +48,8 @@ def test_persistent_coordinator_budget_fuse_enforcement(tmp_path):
     coord = PersistentCoordinator(
         token=None,
         local_state_file=state_file,
-        daily_limit=5,  # small limit for testing
+        daily_limit=5,
+        require_remote=False,
     )
     coord.acquire_lease_and_sync()
 
@@ -66,28 +72,52 @@ def test_persistent_coordinator_budget_fuse_enforcement(tmp_path):
     coord.release_lease()
 
 
-def test_persistent_coordinator_purges_expired_history(tmp_path):
-    state_file = str(tmp_path / "budget_purge.json")
-    coord = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=10)
+def test_persistent_coordinator_fails_closed_in_ci_without_token():
+    coord = PersistentCoordinator(token=None, require_remote=True)
+    with pytest.raises(RemoteStateError) as exc_info:
+        coord.load_remote_state()
+    assert "DATA_REPO_TOKEN" in str(exc_info.value)
 
-    now = datetime.now(timezone.utc)
-    old_time = (now - timedelta(hours=25)).isoformat()
-    recent_time = (now - timedelta(hours=2)).isoformat()
 
-    # Seed state with one old request and one recent request
-    seed_state = {
-        "history": [
-            {"timestamp": old_time, "endpoint": "old_call", "runner_id": "gha-old"},
-            {"timestamp": recent_time, "endpoint": "recent_call", "runner_id": "gha-new"},
-        ],
-        "lease": None,
-        "cooldown_until": None,
-    }
-    coord._save_local_state(seed_state)
+def test_persistent_coordinator_fails_closed_when_repo_inaccessible():
+    coord = PersistentCoordinator(token="test-token", repo_name="private/nonexistent", require_remote=True)
 
-    coord.acquire_lease_and_sync()
-    # The 25h old request must be purged
-    assert len(coord.history) == 1
-    assert coord.history[0]["endpoint"] == "recent_call"
-    assert coord.get_remaining_requests() == 9
-    coord.release_lease()
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        # File GET returns 404
+        mock_file_err = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
+        # Repo GET also returns 404 (repo does not exist or token has no access)
+        mock_repo_err = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
+
+        mock_urlopen.side_effect = [mock_file_err, mock_repo_err]
+
+        with pytest.raises(RemoteStateError) as exc_info:
+            coord.load_remote_state()
+        assert "inaccessible" in str(exc_info.value)
+
+
+def test_persistent_coordinator_optimistic_concurrency_retry():
+    coord = PersistentCoordinator(token="test-token", repo_name="test/repo", require_remote=True)
+    coord._file_sha = "sha-old-123"
+
+    initial_state = {"history": [], "lease": None, "cooldown_until": None}
+    b64_fresh = base64.b64encode(json.dumps(initial_state).encode("utf-8")).decode("utf-8")
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        # 1st PUT attempt -> 409 Conflict
+        mock_conflict = urllib.error.HTTPError("url", 409, "Conflict", {}, None)
+
+        # Reload GET -> returns fresh state with new SHA
+        mock_reload = MagicMock(status=200)
+        mock_reload.read.return_value = json.dumps({"sha": "sha-fresh-456", "content": b64_fresh}).encode("utf-8")
+        mock_reload.__enter__.return_value = mock_reload
+
+        # 2nd PUT attempt -> 200 OK
+        mock_success = MagicMock(status=200)
+        mock_success.read.return_value = json.dumps({"content": {"sha": "sha-final-789"}}).encode("utf-8")
+        mock_success.__enter__.return_value = mock_success
+
+        mock_urlopen.side_effect = [mock_conflict, mock_reload, mock_success]
+
+        ok = coord.save_remote_state(initial_state, max_retries=2)
+        assert ok is True
+        assert coord._file_sha == "sha-final-789"

@@ -59,10 +59,19 @@ Since September 2026, PSX enforces an anti-scraping session token:
 - **Monthly Volume (22 trading days):** ~11.8 MB / month.
 - **Annual Volume:** **~140 MB / year**.
 
-### Sustainability Limits
-- **GitHub Repository Recommendation:** 1 GB soft recommendation, 5 GB hard ceiling.
-- **Projected Lifespan:** At ~140 MB/year, `MahadImran/psx-research-data` can operate for **over 7 years** before reaching 1 GB, and over 35 years before reaching 5 GB.
-- **Tree Health:** All files are sharded into `raw/YYYY/MM/DD/` and `manifests/YYYY-MM-DD.json`, preventing directory bloat and maintaining fast git operations.
+### Realistic Durability Limits & Lifecycle Management
+- **Annual Growth:** ~140 MB / year of compressed `.json.gz` files.
+- **Git Repository Dynamics:**
+  - **Years 1–3 (< 500 MB):** Direct Git tree operations and API commits perform efficiently. Shallow clones (`fetch-depth: 1`) in GitHub Actions remain under 5 seconds.
+  - **Years 3–5 (500 MB – 1 GB):** Reaches GitHub's soft recommended repository size. Ephemeral runner clone times increase without sparse-checkout or shallow history.
+  - **Mitigation & Retention Strategy:** Annual archive releases (`git bundle` or release tarballs) preserve long-term history while active working repository keeps recent 24-month rolling history.
+- **Recovery Objectives (RPO / RTO):**
+  - **RPO (Recovery Point Objective):** 1 trading day (nightly immutable raw commit and D1 export).
+  - **RTO (Recovery Time Objective):** < 15 minutes (shallow clone from private GitHub archive + D1 batch schema rehydration).
+- **Historical Data Limitations & Provenance:**
+  - `/timeseries/eod/<SYMBOL>` bars are **raw unadjusted settlement close** prices, NOT dividend- or split-adjusted.
+  - High and Low values are omitted in `/timeseries/eod/` by PSX and are therefore nullable in `daily_bars`. They are never fabricated.
+  - Accurate backtesting requires combining raw prices with corporate action adjustment factors (bonus shares, dividends, rights offerings).
 
 ---
 

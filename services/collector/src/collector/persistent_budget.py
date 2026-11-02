@@ -2,25 +2,35 @@
 Persistent Cross-Runner Budget and Lease Coordinator.
 Coordinates single-collector leases and enforces the 250 req/24h rolling budget
 across ephemeral GitHub Actions runners using the private archive repository.
+Fails closed in production/CI: never silently falls back to local storage when remote state fails.
 """
 
 from datetime import datetime, timezone, timedelta
 import json
 import logging
 import os
+import time
 import uuid
 import urllib.request
+import urllib.error
 import base64
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class BudgetExceededError(Exception):
+    """Raised when upstream rolling 24h request limit is met or exceeded."""
     pass
 
 
 class LeaseConflictError(Exception):
+    """Raised when another runner actively holds the collector lease or on commit conflict."""
+    pass
+
+
+class RemoteStateError(Exception):
+    """Raised when remote state cannot be verified, fetched, or committed (fail closed)."""
     pass
 
 
@@ -32,28 +42,56 @@ class PersistentCoordinator:
         daily_limit: int = 250,
         lease_ttl_seconds: int = 300,
         local_state_file: Optional[str] = None,
+        require_remote: Optional[bool] = None,
     ):
         self.repo_name = repo_name
         self.token = token or os.environ.get("DATA_REPO_TOKEN")
         self.daily_limit = daily_limit
         self.lease_ttl_seconds = lease_ttl_seconds
         self.local_state_file = local_state_file or os.path.expanduser("~/.psx_persistent_state.json")
+        self.require_remote = (
+            require_remote
+            if require_remote is not None
+            else bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI") or os.environ.get("REQUIRE_REMOTE_STATE"))
+        )
         self.runner_id = f"gha-{os.environ.get('GITHUB_RUN_ID', uuid.uuid4().hex[:8])}"
         self._file_sha: Optional[str] = None
         self.history: List[Dict[str, str]] = []
-        self.active_lease: Optional[Dict[str, str]] = None
+        self.active_lease: Optional[Dict[str, Any]] = None
         self.cooldown_until: Optional[str] = None
 
     def _get_headers(self) -> Dict[str, str]:
+        if not self.token:
+            raise RemoteStateError("DATA_REPO_TOKEN is required to communicate with remote repository.")
         return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "PSXResearchLabCollector/1.0",
         }
 
-    def load_remote_state(self) -> Dict:
-        """Fetch persistent state from private data repo or local fallback."""
+    def verify_repo_access(self) -> bool:
+        """Confirms that the repository exists and our token has access."""
+        url = f"https://api.github.com/repos/{self.repo_name}"
+        try:
+            req = urllib.request.Request(url, headers=self._get_headers())
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status == 200
+        except urllib.error.HTTPError as e:
+            logger.error("Repository %s access check failed (HTTP %d)", self.repo_name, e.code)
+            raise RemoteStateError(f"Remote repository {self.repo_name} inaccessible: HTTP {e.code}")
+        except Exception as e:
+            logger.error("Repository %s network access error: %s", self.repo_name, e)
+            raise RemoteStateError(f"Failed to connect to GitHub API for {self.repo_name}: {e}")
+
+    def load_remote_state(self) -> Dict[str, Any]:
+        """
+        Fetch persistent state from private data repo.
+        Fails closed if remote state cannot be verified in CI/production.
+        """
         if not self.token:
+            if self.require_remote:
+                raise RemoteStateError("Production environment requires DATA_REPO_TOKEN for persistent coordination.")
+            logger.info("Local dev mode: using local state file %s", self.local_state_file)
             return self._load_local_state()
 
         url = f"https://api.github.com/repos/{self.repo_name}/contents/state/budget_and_lease.json"
@@ -63,67 +101,128 @@ class PersistentCoordinator:
                 data = json.loads(resp.read().decode("utf-8"))
                 self._file_sha = data.get("sha")
                 content = base64.b64decode(data.get("content", "")).decode("utf-8")
-                return json.loads(content)
+                parsed = json.loads(content)
+                self.history = parsed.get("history", [])
+                self.active_lease = parsed.get("lease")
+                self.cooldown_until = parsed.get("cooldown_until")
+                return parsed
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                # File doesn't exist yet in archive repo
+                # Do NOT blindly accept 404 without verifying repository access first
+                self.verify_repo_access()
+                # Repository exists, but state file not yet initialized
+                logger.info("Repository exists; initializing fresh state/budget_and_lease.json")
                 self._file_sha = None
                 return {"history": [], "lease": None, "cooldown_until": None}
-            logger.warning("Failed to fetch remote state (%s), falling back to local", e)
+            if self.require_remote:
+                raise RemoteStateError(f"Remote state read failed with HTTP {e.code}: {e.read().decode('utf-8', errors='ignore')}")
+            logger.warning("Failed to fetch remote state (HTTP %s), falling back to local for dev", e.code)
             return self._load_local_state()
         except Exception as e:
-            logger.warning("Remote state fetch exception: %s", e)
+            if self.require_remote:
+                raise RemoteStateError(f"Remote state connection failed: {e}")
+            logger.warning("Remote state fetch exception (%s), falling back to local for dev", e)
             return self._load_local_state()
 
-    def save_remote_state(self, state: Dict) -> bool:
-        """Commit updated state to private data repo or local fallback."""
+    def save_remote_state(self, state: Dict[str, Any], max_retries: int = 3) -> bool:
+        """
+        Commit updated state to private data repo using optimistic concurrency.
+        Fails closed in CI/production. Retries on HTTP 409 (Git commit conflict).
+        """
         if not self.token:
+            if self.require_remote:
+                raise RemoteStateError("Production environment requires DATA_REPO_TOKEN to persist state.")
             return self._save_local_state(state)
 
         url = f"https://api.github.com/repos/{self.repo_name}/contents/state/budget_and_lease.json"
-        content_bytes = json.dumps(state, indent=2).encode("utf-8")
-        payload = {
-            "message": f"chore(state): update budget & lease [{self.runner_id}]",
-            "content": base64.b64encode(content_bytes).decode("utf-8"),
-        }
-        if self._file_sha:
-            payload["sha"] = self._file_sha
 
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={**self._get_headers(), "Content-Type": "application/json"},
-                method="PUT",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                self._file_sha = data.get("content", {}).get("sha")
-                return True
-        except Exception as e:
-            logger.warning("Failed to commit remote state: %s. Using local state.", e)
-            return self._save_local_state(state)
+        for attempt in range(max_retries):
+            content_bytes = json.dumps(state, indent=2).encode("utf-8")
+            payload = {
+                "message": f"chore(state): update budget & lease [{self.runner_id}] (attempt {attempt+1})",
+                "content": base64.b64encode(content_bytes).decode("utf-8"),
+            }
+            if self._file_sha:
+                payload["sha"] = self._file_sha
 
-    def _load_local_state(self) -> Dict:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={**self._get_headers(), "Content-Type": "application/json"},
+                    method="PUT",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    self._file_sha = resp_data.get("content", {}).get("sha")
+                    self.history = state.get("history", [])
+                    self.active_lease = state.get("lease")
+                    self.cooldown_until = state.get("cooldown_until")
+                    return True
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="ignore")
+                if e.code == 409 and attempt < max_retries - 1:
+                    logger.warning("Concurrent commit conflict (HTTP 409). Reloading fresh state (attempt %d)...", attempt + 1)
+                    time.sleep(0.5 * (2 ** attempt))
+                    fresh_state = self.load_remote_state()
+                    # Re-check lease validity against fresh state
+                    existing_lease = fresh_state.get("lease")
+                    if existing_lease and state.get("lease"):
+                        now = datetime.now(timezone.utc)
+                        expires_at = datetime.fromisoformat(existing_lease["expires_at"])
+                        if now < expires_at and existing_lease.get("owner") != self.runner_id:
+                            raise LeaseConflictError(f"Lease acquired by competitor {existing_lease.get('owner')} during commit conflict.")
+                    # Merge history
+                    all_history = fresh_state.get("history", []) + [
+                        h for h in state.get("history", [])
+                        if h not in fresh_state.get("history", [])
+                    ]
+                    state["history"] = all_history
+                    continue
+
+                if self.require_remote:
+                    raise RemoteStateError(f"Failed to commit remote state (HTTP {e.code}): {err_body}")
+                logger.warning("Failed to commit remote state: HTTP %d %s", e.code, err_body)
+                return self._save_local_state(state)
+            except Exception as e:
+                if self.require_remote:
+                    raise RemoteStateError(f"Remote state commit network exception: {e}")
+                logger.warning("Remote state commit error: %s", e)
+                return self._save_local_state(state)
+
+        raise RemoteStateError(f"Failed to commit remote state after {max_retries} attempts.")
+
+    def _load_local_state(self) -> Dict[str, Any]:
         if os.path.exists(self.local_state_file):
             try:
                 with open(self.local_state_file, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                    data = json.load(f)
+                    self.history = data.get("history", [])
+                    self.active_lease = data.get("lease")
+                    self.cooldown_until = data.get("cooldown_until")
+                    return data
+            except Exception as e:
+                logger.warning("Error reading local state: %s", e)
         return {"history": [], "lease": None, "cooldown_until": None}
 
-    def _save_local_state(self, state: Dict) -> bool:
+    def _save_local_state(self, state: Dict[str, Any]) -> bool:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.local_state_file)), exist_ok=True)
             with open(self.local_state_file, "w") as f:
                 json.dump(state, f, indent=2)
+            self.history = state.get("history", [])
+            self.active_lease = state.get("lease")
+            self.cooldown_until = state.get("cooldown_until")
             return True
-        except Exception:
+        except Exception as e:
+            logger.error("Failed to write local state: %s", e)
             return False
 
     def acquire_lease_and_sync(self) -> None:
-        """Acquires single-collector lease and loads 24h request history."""
+        """
+        Acquires single-collector lease, commits it remotely, and purges expired requests.
+        Fails closed: if remote state cannot be verified and committed, throws exception.
+        """
         state = self.load_remote_state()
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
@@ -140,28 +239,38 @@ class PersistentCoordinator:
 
         # Acquire new lease
         lease_expires = (now + timedelta(seconds=self.lease_ttl_seconds)).isoformat()
-        self.active_lease = {
+        new_lease = {
             "owner": self.runner_id,
             "acquired_at": now_iso,
             "expires_at": lease_expires,
         }
-        state["lease"] = self.active_lease
+        state["lease"] = new_lease
 
         # Purge requests older than 24h
         cutoff = (now - timedelta(hours=24)).isoformat()
         self.history = [r for r in state.get("history", []) if r["timestamp"] >= cutoff]
         state["history"] = self.history
 
-        self.save_remote_state(state)
+        # Commit remotely and verify
+        success = self.save_remote_state(state)
+        if not success:
+            raise RemoteStateError("Lease acquisition failed: unable to commit lease to remote repository.")
+        self.active_lease = new_lease
+        logger.info("Lease acquired successfully for runner %s until %s", self.runner_id, lease_expires)
 
     def release_lease(self) -> None:
-        """Releases the collector lease on clean termination."""
-        state = self.load_remote_state()
-        if state.get("lease", {}).get("owner") == self.runner_id:
-            state["lease"] = None
-        state["history"] = self.history
-        self.save_remote_state(state)
-        self.active_lease = None
+        """Releases the collector lease and syncs final history."""
+        try:
+            state = self.load_remote_state()
+            if state.get("lease", {}).get("owner") == self.runner_id:
+                state["lease"] = None
+            state["history"] = self.history
+            self.save_remote_state(state)
+            self.active_lease = None
+            logger.info("Lease cleanly released for runner %s", self.runner_id)
+        except Exception as e:
+            logger.warning("Error releasing lease: %s", e)
+            self.active_lease = None
 
     def get_remaining_requests(self) -> int:
         now = datetime.now(timezone.utc)
@@ -170,7 +279,11 @@ class PersistentCoordinator:
         return max(0, self.daily_limit - len(active))
 
     def record_request(self, endpoint: str) -> None:
-        """Enforces the 250 req/24h limit. Raises BudgetExceededError if limit met."""
+        """
+        Records an upstream request against the rolling 24h budget.
+        Raises BudgetExceededError if limit is met.
+        Immediately updates history in memory and attempts remote sync.
+        """
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=24)).isoformat()
         self.history = [r for r in self.history if r["timestamp"] >= cutoff]
@@ -180,8 +293,18 @@ class PersistentCoordinator:
                 f"Rolling 24h upstream budget limit ({self.daily_limit}) reached! Cannot request {endpoint}."
             )
 
-        self.history.append({
+        entry = {
             "timestamp": now.isoformat(),
             "endpoint": endpoint,
             "runner_id": self.runner_id,
-        })
+        }
+        self.history.append(entry)
+
+    def sync_budget_to_remote(self) -> None:
+        """Flushes recorded requests to remote state."""
+        state = {
+            "history": self.history,
+            "lease": self.active_lease,
+            "cooldown_until": self.cooldown_until,
+        }
+        self.save_remote_state(state)

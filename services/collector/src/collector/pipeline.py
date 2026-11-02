@@ -2,7 +2,7 @@
 PSX Research Lab — Durable Collector Orchestration Pipeline.
 Integrates MarketCalendar, Healthchecks, PersistentCoordinator,
 PSXDPSAdapter, QuarantineAuditor, DurableArchiveManager, and IngestClient.
-Runs cleanly within GitHub Actions Ubuntu runners.
+Fails closed: never swallows archive or persistence errors.
 """
 
 from datetime import datetime, timezone
@@ -15,11 +15,16 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from .adapters.psx_dps_adapter import PSXDPSAdapter
-from .archive import DurableArchiveManager
+from .archive import DurableArchiveManager, ArchiveCommitError, ArchiveCredentialsError
 from .calendar import MarketCalendar
 from .healthchecks import HealthchecksNotifier
 from .ingest_client import IngestClient
-from .persistent_budget import PersistentCoordinator, BudgetExceededError, LeaseConflictError
+from .persistent_budget import (
+    PersistentCoordinator,
+    BudgetExceededError,
+    LeaseConflictError,
+    RemoteStateError,
+)
 from .quarantine import QuarantineAuditor
 from .reconciliation import EODReconciler
 from .session_token import PSXTokenProvider
@@ -38,9 +43,16 @@ class CollectorPipeline:
         reconciler: Optional[EODReconciler] = None,
         token_provider: Optional[PSXTokenProvider] = None,
     ):
-        self.token_provider = token_provider or PSXTokenProvider()
-        self.adapter = adapter or PSXDPSAdapter(token_provider=self.token_provider)
         self.coordinator = coordinator or PersistentCoordinator()
+        self.token_provider = token_provider or PSXTokenProvider(budget_recorder=self.coordinator)
+        self.adapter = adapter or PSXDPSAdapter(
+            token_provider=self.token_provider,
+            budget_manager=self.coordinator,
+        )
+        # Ensure transport uses persistent coordinator for all low-level calls
+        if hasattr(self.adapter, "client") and hasattr(self.adapter.client, "transport"):
+            self.adapter.client.transport.budget_recorder = self.coordinator
+
         self.archive_manager = archive_manager or DurableArchiveManager()
         self.healthchecks = healthchecks or HealthchecksNotifier()
         self.ingest_client = ingest_client or IngestClient()
@@ -54,7 +66,16 @@ class CollectorPipeline:
     ) -> Dict[str, Any]:
         """
         Executes a single scheduled collector cycle.
-        Returns execution telemetry dictionary.
+        Returns execution telemetry dictionary with precise status semantics:
+        - FULLY_SUCCESSFUL_CYCLE
+        - ARCHIVE_COMMITTED_INGEST_PENDING
+        - DATA_UNCHANGED
+        - ARCHIVE_FAILED
+        - INGEST_FAILED
+        - SOURCE_UNAVAILABLE
+        - MARKET_CLOSED
+        - SKIPPED_LEASE_CONFLICT
+        - BUDGET_EXHAUSTED
         """
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         now_pkt = MarketCalendar.now_pkt()
@@ -70,7 +91,7 @@ class CollectorPipeline:
             self.healthchecks.ping_skip(reason)
             return {
                 "runId": run_id,
-                "status": "SKIPPED",
+                "status": "MARKET_CLOSED",
                 "reason": reason,
                 "tradingDate": trading_date,
             }
@@ -78,17 +99,21 @@ class CollectorPipeline:
         # 2. Healthchecks start ping
         self.healthchecks.ping_start()
 
-        # 3. Distributed lease acquisition & budget synchronization
+        # 3. Distributed lease acquisition & persistent budget sync (fails closed on remote errors)
         try:
             self.coordinator.acquire_lease_and_sync()
         except LeaseConflictError as e:
             logger.warning("Lease conflict detected: %s", e)
-            self.healthchecks.ping_skip(str(e))
+            self.healthchecks.ping_skip(f"Lease conflict: {e}")
             return {
                 "runId": run_id,
                 "status": "SKIPPED_LEASE_CONFLICT",
                 "reason": str(e),
             }
+        except RemoteStateError as e:
+            logger.error("Remote coordination state failed: %s", e)
+            self.healthchecks.ping_fail(f"Remote state error: {e}")
+            raise
 
         try:
             remaining_budget = self.coordinator.get_remaining_requests()
@@ -102,7 +127,7 @@ class CollectorPipeline:
                     "remainingBudget": remaining_budget,
                 }
 
-            # 4. Ingest and Archival Data Structures
+            # 4. Ingestion & Archive Data Structures
             ingest_bars: List[Dict[str, Any]] = []
             ingest_snapshot: Optional[Dict[str, Any]] = None
             ingest_indices: List[Dict[str, Any]] = []
@@ -110,8 +135,16 @@ class CollectorPipeline:
 
             # 5. Market-wide Snapshot Extraction
             logger.info("Fetching market-wide snapshot from PSX...")
-            self.coordinator.record_request("snapshot")
-            snapshot_resp = self.adapter.get_snapshot()
+            try:
+                snapshot_resp = self.adapter.get_snapshot()
+            except Exception as e:
+                logger.error("PSX snapshot fetch failed: %s", e)
+                self.healthchecks.ping_fail(f"PSX snapshot failure: {e}")
+                return {
+                    "runId": run_id,
+                    "status": "SOURCE_UNAVAILABLE",
+                    "error": str(e),
+                }
 
             snapshot_data = snapshot_resp.data
             raw_rows = snapshot_data.get("rows", [])
@@ -137,7 +170,14 @@ class CollectorPipeline:
             snapshot_sha256 = snapshot_resp.raw_sha256
             batch_id = str(uuid.uuid4())
 
-            if observations:
+            # 6. Deduplication Check against previous poll
+            # Check if this snapshot hash is identical to last known in coordinator state
+            last_snapshot_hash = getattr(self.coordinator, "last_snapshot_hash", None)
+            is_duplicate = (last_snapshot_hash == snapshot_sha256) and not force
+            if is_duplicate:
+                logger.info("Data unchanged since last poll (SHA-256 identical).")
+
+            if observations and not is_duplicate:
                 ingest_snapshot = {
                     "source": "psx-dps",
                     "batchId": batch_id,
@@ -148,7 +188,7 @@ class CollectorPipeline:
                     "rawSha256": snapshot_sha256,
                 }
 
-                # Stage and archive compressed raw response
+                # Stage locally and commit to private archive (with readback verification)
                 if not dry_run:
                     rel_path, comp_bytes, sha_hash, _ = self.archive_manager.stage_locally(
                         source="psx-dps",
@@ -156,62 +196,57 @@ class CollectorPipeline:
                         trading_date=trading_date,
                         data=snapshot_data,
                     )
-                    archived_files.append(rel_path)
-                    try:
-                        self.archive_manager.commit_file_to_archive(
-                            rel_path=rel_path,
-                            content_bytes=comp_bytes,
-                            commit_message=f"data(snapshot): {trading_date} batch {batch_id[:8]}",
-                        )
-                    except Exception as e:
-                        logger.warning("Could not commit snapshot to remote archive: %s", e)
-
-            # 6. Active Indices Extraction
-            if self.coordinator.get_remaining_requests() > 2:
-                logger.info("Fetching active market indices...")
-                self.coordinator.record_request("indices")
-                indices_resp = self.adapter.get_indices()
-                indices_data = indices_resp.data
-
-                # Normalise indices
-                idx_list = indices_data if isinstance(indices_data, list) else indices_data.get("rows", [])
-                for idx in idx_list:
-                    code = str(idx.get("code") or idx.get("symbol") or idx.get("index") or "").upper()
-                    cur = float(idx.get("current", 0.0) or idx.get("value", 0.0) or 0.0)
-                    if code and cur > 0:
-                        ingest_indices.append({
-                            "code": code,
-                            "current": cur,
-                            "change": float(idx.get("change", 0.0) or 0.0),
-                            "changePercent": float(idx.get("percentChange", 0.0) or 0.0),
-                            "volume": int(idx.get("volume", 0) or 0),
-                            "tradingDate": trading_date,
-                            "fetchedAtUtc": now_utc,
-                        })
-
-                if not dry_run and idx_list:
-                    rel_path, comp_bytes, _, _ = self.archive_manager.stage_locally(
-                        source="psx-dps",
-                        endpoint="indices",
-                        trading_date=trading_date,
-                        data=indices_data,
+                    # Must fail closed if remote commit fails
+                    self.archive_manager.commit_file_to_archive(
+                        rel_path=rel_path,
+                        content_bytes=comp_bytes,
+                        commit_message=f"data(snapshot): {trading_date} batch {batch_id[:8]}",
                     )
                     archived_files.append(rel_path)
-                    try:
+
+            # 7. Active Indices Extraction
+            if self.coordinator.get_remaining_requests() > 2:
+                logger.info("Fetching active market indices...")
+                try:
+                    indices_resp = self.adapter.get_indices()
+                    indices_data = indices_resp.data
+
+                    idx_list = indices_data if isinstance(indices_data, list) else indices_data.get("rows", [])
+                    for idx in idx_list:
+                        code = str(idx.get("code") or idx.get("symbol") or idx.get("index") or "").upper()
+                        cur = float(idx.get("current", 0.0) or idx.get("value", 0.0) or 0.0)
+                        if code and cur > 0:
+                            ingest_indices.append({
+                                "code": code,
+                                "current": cur,
+                                "change": float(idx.get("change", 0.0) or 0.0),
+                                "changePercent": float(idx.get("percentChange", 0.0) or 0.0),
+                                "volume": int(idx.get("volume", 0) or 0),
+                                "tradingDate": trading_date,
+                                "fetchedAtUtc": now_utc,
+                            })
+
+                    if not dry_run and idx_list and not is_duplicate:
+                        rel_path, comp_bytes, _, _ = self.archive_manager.stage_locally(
+                            source="psx-dps",
+                            endpoint="indices",
+                            trading_date=trading_date,
+                            data=indices_data,
+                        )
                         self.archive_manager.commit_file_to_archive(
                             rel_path=rel_path,
                             content_bytes=comp_bytes,
                             commit_message=f"data(indices): {trading_date}",
                         )
-                    except Exception as e:
-                        logger.warning("Could not commit indices to remote archive: %s", e)
+                        archived_files.append(rel_path)
+                except Exception as e:
+                    logger.warning("Non-fatal: indices fetch failed: %s", e)
 
-            # 7. EOD Settlement Reconciliation (during post-close window or if force_eod)
+            # 8. EOD Settlement Reconciliation (during post-close window or if force_eod)
             reconciliation_summary: Optional[Dict[str, Any]] = None
             is_post_close = "post_close" in reason.lower() or force_eod
             if is_post_close and self.coordinator.get_remaining_requests() > 2:
                 logger.info("Running EOD Settlement Reconciliation for %s...", trading_date)
-                self.coordinator.record_request(f"history_date/{trading_date}")
                 try:
                     eod_resp = self.adapter.get_historical_date(trading_date)
                     eod_records = eod_resp.data if isinstance(eod_resp.data, list) else eod_resp.data.get("rows", [])
@@ -229,19 +264,18 @@ class CollectorPipeline:
                             trading_date=trading_date,
                             data=eod_resp.data,
                         )
+                        self.archive_manager.commit_file_to_archive(
+                            rel_path=rel_path,
+                            content_bytes=comp_bytes,
+                            commit_message=f"data(eod): {trading_date} official settlement",
+                        )
                         archived_files.append(rel_path)
-                        try:
-                            self.archive_manager.commit_file_to_archive(
-                                rel_path=rel_path,
-                                content_bytes=comp_bytes,
-                                commit_message=f"data(eod): {trading_date} official settlement",
-                            )
-                        except Exception as e:
-                            logger.warning("Could not commit EOD to remote archive: %s", e)
                 except Exception as e:
-                    logger.warning("EOD reconciliation fetch failed: %s", e)
+                    logger.error("EOD reconciliation failed: %s", e)
+                    self.healthchecks.ping_fail(f"EOD reconciliation error: {e}")
+                    raise
 
-            # 8. Create and Commit Daily Manifest
+            # 9. Create and Commit Daily Manifest (ONLY referencing successfully verified files)
             manifest_payload = {
                 "manifestVersion": "1.0.0",
                 "generatedAtUtc": now_utc,
@@ -252,15 +286,13 @@ class CollectorPipeline:
                 "totalIndices": len(ingest_indices),
                 "payloadSha256": snapshot_sha256,
                 "archivePath": archived_files[0] if archived_files else None,
+                "verifiedArchiveFiles": archived_files,
             }
 
-            if not dry_run:
-                try:
-                    self.archive_manager.commit_daily_manifest(trading_date, manifest_payload)
-                except Exception as e:
-                    logger.warning("Could not commit daily manifest: %s", e)
+            if not dry_run and archived_files:
+                self.archive_manager.commit_daily_manifest(trading_date, manifest_payload)
 
-            # 9. Ingest to Cloudflare API
+            # 10. Ingest to Cloudflare API (if API configured and reachable)
             ingest_payload = {
                 "manifest": manifest_payload,
                 "bars": ingest_bars,
@@ -271,25 +303,47 @@ class CollectorPipeline:
                 "nonce": uuid.uuid4().hex,
             }
 
-            ingest_success = False
+            ingest_status = "PENDING"
             if not dry_run and (ingest_bars or ingest_snapshot or ingest_indices):
-                ingest_success, status_code, resp_body = self.ingest_client.send_ingestion(ingest_payload)
-                logger.info("Ingest API result: %s (status %d)", ingest_success, status_code)
+                if self.ingest_client.api_url and self.ingest_client.api_url.startswith("http"):
+                    ok, code, resp_data = self.ingest_client.send_ingestion(ingest_payload)
+                    if ok:
+                        ingest_status = "ACCEPTED"
+                    else:
+                        ingest_status = "FAILED"
+                        logger.error("Cloudflare Ingestion API failed (HTTP %d): %s", code, resp_data)
+                        self.healthchecks.ping_fail(f"Cloudflare Ingest HTTP {code}: {resp_data.get('reason', 'Failed')}")
+                        return {
+                            "runId": run_id,
+                            "status": "INGEST_FAILED",
+                            "httpStatus": code,
+                            "archivedFiles": archived_files,
+                            "remainingBudget": self.coordinator.get_remaining_requests(),
+                        }
+                else:
+                    ingest_status = "NOT_CONFIGURED"
 
-            # 10. Healthchecks Success Heartbeat
+            # 11. Final Status Determination & Healthchecks Notification
+            final_status = "FULLY_SUCCESSFUL_CYCLE"
+            if is_duplicate:
+                final_status = "DATA_UNCHANGED"
+            elif ingest_status in ("NOT_CONFIGURED", "PENDING"):
+                final_status = "ARCHIVE_COMMITTED_INGEST_PENDING"
+
             remaining_after = self.coordinator.get_remaining_requests()
             summary_msg = (
-                f"OK {trading_date} [{run_id}]: "
-                f"snapshot_symbols={len(observations)}, "
+                f"{final_status} {trading_date} [{run_id}]: "
+                f"symbols={len(observations)}, "
                 f"indices={len(ingest_indices)}, "
-                f"reconciled_bars={len(ingest_bars)}, "
-                f"remaining_requests={remaining_after}/250"
+                f"bars={len(ingest_bars)}, "
+                f"archived={len(archived_files)}, "
+                f"budget_remaining={remaining_after}/250"
             )
             self.healthchecks.ping_success(summary_msg)
 
             return {
                 "runId": run_id,
-                "status": "SUCCESS",
+                "status": final_status,
                 "tradingDate": trading_date,
                 "snapshotSymbolsCount": len(observations),
                 "indicesCount": len(ingest_indices),
@@ -297,16 +351,25 @@ class CollectorPipeline:
                 "reconciliation": reconciliation_summary,
                 "archivedFiles": archived_files,
                 "remainingBudget": remaining_after,
-                "ingestSuccess": ingest_success,
+                "ingestStatus": ingest_status,
             }
 
+        except (ArchiveCommitError, ArchiveCredentialsError) as e:
+            logger.error("Durable archive failure: %s", e)
+            self.healthchecks.ping_fail(f"Archive failure [{run_id}]: {e}")
+            return {
+                "runId": run_id,
+                "status": "ARCHIVE_FAILED",
+                "error": str(e),
+                "remainingBudget": self.coordinator.get_remaining_requests(),
+            }
         except Exception as e:
             logger.exception("Collector execution failed: %s", e)
             self.healthchecks.ping_fail(f"Collector error [{run_id}]: {e}")
             raise
         finally:
-            # Always cleanly release distributed lease
+            # Sync persistent budget and release lease
             try:
                 self.coordinator.release_lease()
             except Exception as e:
-                logger.warning("Failed to release lease: %s", e)
+                logger.warning("Failed to release lease cleanly: %s", e)

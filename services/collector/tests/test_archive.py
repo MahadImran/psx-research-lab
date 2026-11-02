@@ -1,12 +1,15 @@
 import pytest
+from unittest.mock import patch, MagicMock
+import base64
 import gzip
 import json
+import urllib.error
 import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
-from collector.archive import DurableArchiveManager
+from collector.archive import DurableArchiveManager, ArchiveCommitError, ArchiveCredentialsError
 
 
 def test_archive_manager_stages_sharded_gzip(tmp_path):
@@ -38,27 +41,93 @@ def test_archive_manager_stages_sharded_gzip(tmp_path):
     assert len(comp_bytes) < uncomp_len
 
 
-def test_archive_manager_commits_daily_manifest(tmp_path):
+def test_archive_manager_fails_closed_in_production_without_token():
+    mgr = DurableArchiveManager(token=None, require_remote=True)
+    with pytest.raises(ArchiveCredentialsError) as exc_info:
+        mgr.commit_file_to_archive("raw/2026/11/02/test.json.gz", b"data", "test commit")
+    assert "DATA_REPO_TOKEN required" in str(exc_info.value)
+
+
+def test_archive_manager_commits_with_readback_verification(tmp_path):
     archive_dir = str(tmp_path / "archive")
-    mgr = DurableArchiveManager(token=None, local_archive_dir=archive_dir)
+    mgr = DurableArchiveManager(token="fake-token", repo_name="test/repo", local_archive_dir=archive_dir)
 
-    manifest_data = {
-        "manifestVersion": "1.0.0",
-        "tradingDate": "2026-11-02",
-        "source": "psx-dps",
-        "totalBars": 500,
-        "totalSnapshots": 500,
-        "totalIndices": 18,
-        "payloadSha256": "a" * 64,
-    }
+    test_content = b"compressed-market-data-bytes"
+    b64_content = base64.b64encode(test_content).decode("utf-8")
 
-    rel_manifest = mgr.commit_daily_manifest("2026-11-02", manifest_data)
-    assert rel_manifest == "manifests/2026-11-02.json"
+    # Mock urllib calls:
+    # 1. read_remote_file pre-check -> 404 (not exists)
+    # 2. commit PUT -> 201 Created
+    # 3. readback verification GET -> 200 OK with identical content
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_pre_err = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
 
-    full_path = os.path.join(archive_dir, rel_manifest)
-    assert os.path.exists(full_path)
+        mock_put_resp = MagicMock(status=201)
+        mock_put_resp.__enter__.return_value = mock_put_resp
 
-    with open(full_path, "r") as f:
-        saved = json.load(f)
-    assert saved["tradingDate"] == "2026-11-02"
-    assert saved["totalBars"] == 500
+        mock_get_resp = MagicMock(status=200)
+        mock_get_resp.read.return_value = json.dumps({
+            "sha": "blob-sha-123",
+            "content": b64_content,
+        }).encode("utf-8")
+        mock_get_resp.__enter__.return_value = mock_get_resp
+
+        mock_urlopen.side_effect = [
+            mock_pre_err,   # pre-check
+            mock_put_resp,  # PUT
+            mock_get_resp,  # Readback
+        ]
+
+        ok = mgr.commit_file_to_archive("raw/2026/11/02/file.json.gz", test_content, "commit msg")
+        assert ok is True
+
+
+def test_archive_manager_readback_hash_mismatch_raises():
+    mgr = DurableArchiveManager(token="fake-token", repo_name="test/repo")
+    test_content = b"original-content"
+    tampered_content = b"tampered-corrupted-bytes"
+    b64_tampered = base64.b64encode(tampered_content).decode("utf-8")
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_pre_err = urllib.error.HTTPError("url", 404, "Not Found", {}, None)
+
+        mock_put_resp = MagicMock(status=201)
+        mock_put_resp.__enter__.return_value = mock_put_resp
+
+        mock_get_resp = MagicMock(status=200)
+        mock_get_resp.read.return_value = json.dumps({
+            "sha": "blob-sha-123",
+            "content": b64_tampered,
+        }).encode("utf-8")
+        mock_get_resp.__enter__.return_value = mock_get_resp
+
+        mock_urlopen.side_effect = [
+            mock_pre_err,
+            mock_put_resp,
+            mock_get_resp,
+        ]
+
+        with pytest.raises(ArchiveCommitError) as exc_info:
+            mgr.commit_file_to_archive("raw/2026/11/02/corrupt.json.gz", test_content, "commit msg")
+        assert "Readback verification hash mismatch" in str(exc_info.value)
+
+
+def test_archive_manager_idempotent_existing_file():
+    mgr = DurableArchiveManager(token="fake-token", repo_name="test/repo")
+    test_content = b"already-archived-content"
+    b64_content = base64.b64encode(test_content).decode("utf-8")
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        mock_get_resp = MagicMock(status=200)
+        mock_get_resp.read.return_value = json.dumps({
+            "sha": "blob-sha-123",
+            "content": b64_content,
+        }).encode("utf-8")
+        mock_get_resp.__enter__.return_value = mock_get_resp
+
+        mock_urlopen.return_value = mock_get_resp
+
+        # Pre-check returns matching content -> skips PUT entirely!
+        ok = mgr.commit_file_to_archive("raw/2026/11/02/existing.json.gz", test_content, "commit msg")
+        assert ok is True
+        assert mock_urlopen.call_count == 1

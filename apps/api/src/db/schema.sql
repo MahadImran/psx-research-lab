@@ -172,3 +172,13 @@ CREATE TABLE IF NOT EXISTS health_logs (
     details_json TEXT,
     recorded_at_utc TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 13. Durable Nonce Replay Protection (Rejects duplicate requests)
+CREATE TABLE IF NOT EXISTS seen_nonces (
+    nonce TEXT PRIMARY KEY,
+    timestamp_sec INTEGER NOT NULL,
+    created_at_utc TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_seen_nonces_timestamp ON seen_nonces (timestamp_sec);
+

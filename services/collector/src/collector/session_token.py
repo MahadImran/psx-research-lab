@@ -20,9 +20,15 @@ _TOKEN_VALID_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
 
 
 class PSXTokenProvider:
-    def __init__(self, ttl_seconds: int = 3600, timeout_seconds: float = 10.0):
+    def __init__(
+        self,
+        ttl_seconds: int = 3600,
+        timeout_seconds: float = 10.0,
+        budget_recorder: Optional[Any] = None,
+    ):
         self.ttl_seconds = ttl_seconds
         self.timeout_seconds = timeout_seconds
+        self.budget_recorder = budget_recorder
         self._cached_token: Optional[str] = None
         self._cached_at: Optional[datetime] = None
 
@@ -34,6 +40,9 @@ class PSXTokenProvider:
     def get_token(self, force_refresh: bool = False) -> Optional[str]:
         if not force_refresh and self.is_token_valid():
             return self._cached_token
+
+        if self.budget_recorder is not None:
+            self.budget_recorder.record_request("GET / (session token)")
 
         try:
             ctx = ssl.create_default_context()

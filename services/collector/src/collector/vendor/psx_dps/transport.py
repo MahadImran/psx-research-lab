@@ -63,6 +63,7 @@ class Transport:
         self.retries = max(1, int(retries))
         self.user_agent = user_agent or USER_AGENT
         self.token_provider = None
+        self.budget_recorder = None
         self.state_dir = os.path.expanduser(state_dir or self.cache.dir)
         self.node_path = os.path.join(self.state_dir, "node.json")
         self._node = None
@@ -298,6 +299,9 @@ class Transport:
 
             payload = urlencode(body).encode()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        if getattr(self, "budget_recorder", None) is not None:
+            self.budget_recorder.record_request(f"{method} {path}")
 
         if not reuse:
             conn = self._open(ip, timeout)
