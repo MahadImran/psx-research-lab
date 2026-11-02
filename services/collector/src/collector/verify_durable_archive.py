@@ -69,8 +69,10 @@ def run_verification():
         valid_indices = 0
         for idx in idx_list:
             logger.info("  Index record: %s", idx)
-            cur = float(idx.get("current", 0.0) or idx.get("value", 0.0) or 0.0)
-            if cur > 0:
+            code = str(idx.get("code") or idx.get("symbol") or idx.get("Index") or idx.get("index") or "").upper()
+            cur_raw = idx.get("current") or idx.get("Current") or idx.get("value") or 0.0
+            cur = float(cur_raw or 0.0)
+            if code and cur > 0:
                 valid_indices += 1
         assert valid_indices >= 5, f"Expected at least 5 active indices with positive values, found {valid_indices}"
         logger.info("✓ Quarantine validation passed: %d/%d active index records valid.", valid_indices, len(idx_list))

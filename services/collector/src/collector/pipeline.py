@@ -213,15 +213,16 @@ class CollectorPipeline:
 
                     idx_list = indices_data if isinstance(indices_data, list) else indices_data.get("rows", [])
                     for idx in idx_list:
-                        code = str(idx.get("code") or idx.get("symbol") or idx.get("index") or "").upper()
-                        cur = float(idx.get("current", 0.0) or idx.get("value", 0.0) or 0.0)
+                        code = str(idx.get("code") or idx.get("symbol") or idx.get("Index") or idx.get("index") or "").upper()
+                        cur_raw = idx.get("current") or idx.get("Current") or idx.get("value") or 0.0
+                        cur = float(cur_raw or 0.0)
                         if code and cur > 0:
                             ingest_indices.append({
                                 "code": code,
                                 "current": cur,
-                                "change": float(idx.get("change", 0.0) or 0.0),
-                                "changePercent": float(idx.get("percentChange", 0.0) or 0.0),
-                                "volume": int(idx.get("volume", 0) or 0),
+                                "change": float(idx.get("change") or idx.get("Change") or 0.0),
+                                "changePercent": float(idx.get("percentChange") or idx.get("% Change") or 0.0),
+                                "volume": int(float(idx.get("volume") or idx.get("Volume") or 0)),
                                 "tradingDate": trading_date,
                                 "fetchedAtUtc": now_utc,
                             })
