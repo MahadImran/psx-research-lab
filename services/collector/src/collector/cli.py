@@ -65,7 +65,16 @@ def cmd_run(args):
         dry_run=args.dry_run,
     )
     print(json.dumps(result, indent=2, default=str))
-    if result.get("status") in ("SKIPPED", "SUCCESS", "SKIPPED_LEASE_CONFLICT"):
+    valid_success_statuses = (
+        "FULLY_SUCCESSFUL_CYCLE",
+        "DATA_UNCHANGED",
+        "ARCHIVE_COMMITTED_INGEST_PENDING",
+        "MARKET_CLOSED",
+        "SKIPPED_LEASE_CONFLICT",
+        "SUCCESS",
+        "SKIPPED",
+    )
+    if result.get("status") in valid_success_statuses:
         sys.exit(0)
     sys.exit(1)
 

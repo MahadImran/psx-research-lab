@@ -30,9 +30,9 @@ class IngestClient:
         self.api_url = (
             api_url
             or os.environ.get("API_BASE_URL", "")
-            or os.environ.get("INGEST_API_URL", "http://127.0.0.1:8787")
+            or os.environ.get("INGEST_API_URL", "")
         ).rstrip("/")
-        self.hmac_secret = hmac_secret or os.environ.get("INGEST_HMAC_SECRET", "dev-hmac-secret-only")
+        self.hmac_secret = hmac_secret or os.environ.get("INGEST_HMAC_SECRET", "")
         self.client_id = (
             client_id
             or os.environ.get("CLOUDFLARE_CLIENT_ID")
