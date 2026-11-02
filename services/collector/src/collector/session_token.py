@@ -11,7 +11,7 @@ import re
 import ssl
 import time
 import urllib.request
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
