@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
@@ -91,10 +92,16 @@ class DurableArchiveManager:
 
         return rel_path, compressed, sha256_hash, len(raw_json)
 
-    def read_remote_file(self, rel_path: str) -> Tuple[Optional[bytes], Optional[str]]:
+    def read_remote_file(
+        self,
+        rel_path: str,
+        retries: int = 0,
+        retry_delay: float = 0.5,
+    ) -> Tuple[Optional[bytes], Optional[str]]:
         """
         Reads a file back from the archive repository.
         Returns: (content_bytes, file_sha) or (None, None) if not found.
+        Supports bounded retries to accommodate GitHub API edge replica propagation delay.
         """
         if not self.token:
             if self.require_remote:
@@ -106,19 +113,31 @@ class DurableArchiveManager:
             return None, None
 
         url = f"https://api.github.com/repos/{self.repo_name}/contents/{rel_path}"
-        try:
-            req = urllib.request.Request(url, headers=self._get_headers())
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                file_sha = data.get("sha")
-                raw_bytes = base64.b64decode(data.get("content", ""))
-                return raw_bytes, file_sha
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None, None
-            raise ArchiveCommitError(f"Error reading back {rel_path} from archive (HTTP {e.code})")
-        except Exception as e:
-            raise ArchiveCommitError(f"Network error reading back {rel_path}: {e}")
+        headers = self._get_headers()
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
+
+        for attempt in range(retries + 1):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    file_sha = data.get("sha")
+                    raw_bytes = base64.b64decode(data.get("content", ""))
+                    return raw_bytes, file_sha
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    if attempt < retries:
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    return None, None
+                raise ArchiveCommitError(f"Error reading back {rel_path} from archive (HTTP {e.code})")
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                    continue
+                raise ArchiveCommitError(f"Network error reading back {rel_path}: {e}")
+        return None, None
 
     def commit_file_to_archive(self, rel_path: str, content_bytes: bytes, commit_message: str) -> bool:
         """
@@ -168,8 +187,8 @@ class DurableArchiveManager:
             logger.error("Network error committing %s to archive: %s", rel_path, e)
             raise ArchiveCommitError(f"Network error committing {rel_path}: {e}")
 
-        # READBACK VERIFICATION
-        readback_bytes, _ = self.read_remote_file(rel_path)
+        # READBACK VERIFICATION (with retries for API edge propagation)
+        readback_bytes, _ = self.read_remote_file(rel_path, retries=3, retry_delay=0.75)
         if readback_bytes is None:
             raise ArchiveCommitError(f"Readback verification failed: file {rel_path} not found after commit!")
         if readback_bytes != content_bytes:

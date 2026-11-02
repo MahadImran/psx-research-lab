@@ -95,7 +95,7 @@ def run_verification():
 
         # 5. Read back from GitHub REST API and recompute SHA-256
         logger.info("--> [Step 5/8] Reading back committed file from GitHub and recomputing hash...")
-        readback_bytes, file_sha = archive_mgr.read_remote_file(rel_path)
+        readback_bytes, file_sha = archive_mgr.read_remote_file(rel_path, retries=3, retry_delay=0.75)
         assert readback_bytes is not None, f"File {rel_path} not found upon readback!"
         assert readback_bytes == comp_bytes, "Bit-for-bit mismatch between staged and readback bytes!"
 
@@ -122,7 +122,7 @@ def run_verification():
         logger.info("✓ Daily manifest committed: %s", manifest_rel)
 
         # Read back manifest
-        manifest_read_bytes, _ = archive_mgr.read_remote_file(manifest_rel)
+        manifest_read_bytes, _ = archive_mgr.read_remote_file(manifest_rel, retries=3, retry_delay=0.75)
         assert manifest_read_bytes is not None, "Daily manifest readback failed!"
         manifest_data = json.loads(manifest_read_bytes.decode("utf-8"))
         assert manifest_data["archivePath"] == rel_path
