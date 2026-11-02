@@ -123,3 +123,46 @@ When dispatched with repository secrets, it executes the complete 8-step verific
 6. Commits daily integrity manifest referencing verified object.
 7. Reads back manifest and confirms exact path and hash.
 8. Verifies persistent request budget tracking and tests idempotency.
+
+---
+
+## 5. Live GitHub Actions Execution Verification Results
+
+All remediations were tested and verified live on ephemeral GitHub-hosted Ubuntu runners with real production credentials:
+
+### A. Dedicated Durable Archive 8-Step Verification Workflow
+- **Workflow Run:** [41383432374](https://github.com/MahadImran/psx-research-lab/actions/runs/41383432374)
+- **Status:** **SUCCESS (All 8 Steps Passed)**
+- **Runner:** GitHub-hosted `ubuntu-24.04` (Python 3.11.17)
+- **Target Archive:** `MahadImran/psx-research-data`
+- **Verification Evidence:**
+  1. **Remote Lease:** Acquired lease `gha-41383432374` committed to `state/budget_and_lease.json`. Upstream budget remaining: 247/250.
+  2. **Real Upstream Fetch:** Retrieved 18 live indices from PSX upstream in 6201.7 ms (Status 200).
+  3. **Quarantine Validation:** Passed 17/18 active index records (`KSE100`, `NITPGI`, `NBPPGI`, `MZNPI`, `JSMFI`, `ACI`, `JSGBKTI`, `HBLTTI`, `MII30`).
+  4. **Durable Gzip Commit:** Committed raw compressed response `raw/2026/11/02/psx-dps_indices_verify_033023Z_6480c0c6.json.gz` (592 bytes) to `MahadImran/psx-research-data`.
+  5. **Readback Bit-for-Bit Hash Verification:** Re-fetched object from GitHub REST API; computed SHA-256 matched staged hash: `6480c0c608f75b28373b9e4368a513511eb96d11f7ee3f2ee960686ba93bfd2f`.
+  6. **Daily Manifest Commit & Readback:** Generated and committed `manifests/2026-11-02.json` referencing verified raw archive file; readback confirmed identical payload and path pointers.
+  7. **Persistent Budget Accounting:** Verified rolling 24h budget incremented across runs; 1 request consumed and persisted remotely.
+  8. **Idempotency Test:** Repeated identical write against `raw/2026/11/02/...`; detected identical remote content and skipped redundant commit.
+  9. **Lease Cleanup:** Distributed runner lease released cleanly in `finally` block.
+
+### B. Live Scheduled PSX Collector Workflow
+- **Workflow Run:** [41383515746](https://github.com/MahadImran/psx-research-lab/actions/runs/41383674187)
+- **Status:** **SUCCESS** (`ARCHIVE_COMMITTED_INGEST_PENDING`)
+- **Execution Log Highlights:**
+  - Acquired lease `gha-41383674187`
+  - Fetched live market data from PSX upstream
+  - Committed verified compressed raw archive `raw/2026/11/02/psx-dps_indices_033304Z_f179a143.json.gz` (590 bytes)
+  - Committed verified daily manifest `manifests/2026-11-02.json` (463 bytes)
+  - Evaluated Cloudflare ingestion endpoint posture: correctly detected ingestion Worker is pending deployment in M3 (`ingestStatus: "NOT_CONFIGURED"`)
+  - Transmitted verified Healthchecks heartbeat: `ARCHIVE_COMMITTED_INGEST_PENDING 2026-11-02 [run-dcf60b824e4d]: symbols=0, indices=18, bars=0, archived=1, budget_remaining=238/250`
+  - Released distributed lease cleanly
+  - Exited with code 0 (clean operational exit)
+
+### C. Public CI Validation (Push & Pull Request)
+- **Workflow Run:** [41383637172](https://github.com/MahadImran/psx-research-lab/actions/runs/41383637172)
+- **Status:** **SUCCESS**
+- **Results:**
+  - `TypeScript Lint & Test`: 16/16 Vitest tests passed, 0 type errors.
+  - `Python Collector Tests`: 47/47 Pytest tests passed on Python 3.11.17 Linux runner.
+  - Public CI runs without access to privileged secrets and tests fail-closed behavior safely.
