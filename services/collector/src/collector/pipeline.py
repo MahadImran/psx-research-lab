@@ -170,12 +170,11 @@ class CollectorPipeline:
             snapshot_sha256 = snapshot_resp.raw_sha256
             batch_id = str(uuid.uuid4())
 
-            # 6. Deduplication Check against previous poll
-            # Check if this snapshot hash is identical to last known in coordinator state
-            last_snapshot_hash = getattr(self.coordinator, "last_snapshot_hash", None)
+            # 6. Durable, source-specific, trading-date-aware deduplication check
+            last_snapshot_hash = self.coordinator.get_last_snapshot_hash("psx-dps", trading_date)
             is_duplicate = (last_snapshot_hash == snapshot_sha256) and not force
             if is_duplicate:
-                logger.info("Data unchanged since last poll (SHA-256 identical).")
+                logger.info("Data unchanged since last poll for %s on %s (SHA-256 identical).", "psx-dps", trading_date)
 
             if observations and not is_duplicate:
                 ingest_snapshot = {
@@ -196,52 +195,80 @@ class CollectorPipeline:
                         trading_date=trading_date,
                         data=snapshot_data,
                     )
-                    # Must fail closed if remote commit fails
-                    self.archive_manager.commit_file_to_archive(
-                        rel_path=rel_path,
-                        content_bytes=comp_bytes,
-                        commit_message=f"data(snapshot): {trading_date} batch {batch_id[:8]}",
-                    )
-                    archived_files.append(rel_path)
+                    # Must fail closed if remote archive commit fails
+                    try:
+                        self.archive_manager.commit_file_to_archive(
+                            rel_path=rel_path,
+                            content_bytes=comp_bytes,
+                            commit_message=f"data(snapshot): {trading_date} batch {batch_id[:8]}",
+                        )
+                        archived_files.append(rel_path)
+                        # Record durable snapshot hash in coordinator state
+                        self.coordinator.record_snapshot_hash("psx-dps", trading_date, snapshot_sha256)
+                    except (ArchiveCommitError, ArchiveCredentialsError) as e:
+                        logger.error("Durable archive failure while saving snapshot: %s", e)
+                        self.healthchecks.ping_fail(f"Archive failure for snapshot: {e}")
+                        return {
+                            "runId": run_id,
+                            "status": "ARCHIVE_FAILED",
+                            "error": str(e),
+                            "archivedFiles": archived_files,
+                            "tradingDate": trading_date,
+                        }
 
-            # 7. Active Indices Extraction
+            # 7. Active Indices Extraction (Distinct fetch vs archive failure boundaries)
+            indices_data = None
             if self.coordinator.get_remaining_requests() > 2:
                 logger.info("Fetching active market indices...")
                 try:
                     indices_resp = self.adapter.get_indices()
                     indices_data = indices_resp.data
+                except Exception as e:
+                    logger.warning("Optional indices fetch failed (non-fatal): %s", e)
+                    indices_data = None
 
-                    idx_list = indices_data if isinstance(indices_data, list) else indices_data.get("rows", [])
-                    for idx in idx_list:
-                        code = str(idx.get("code") or idx.get("symbol") or idx.get("Index") or idx.get("index") or "").upper()
-                        cur_raw = idx.get("current") or idx.get("Current") or idx.get("value") or 0.0
-                        cur = float(cur_raw or 0.0)
-                        if code and cur > 0:
-                            ingest_indices.append({
-                                "code": code,
-                                "current": cur,
-                                "change": float(idx.get("change") or idx.get("Change") or 0.0),
-                                "changePercent": float(idx.get("percentChange") or idx.get("% Change") or 0.0),
-                                "volume": int(float(idx.get("volume") or idx.get("Volume") or 0)),
-                                "tradingDate": trading_date,
-                                "fetchedAtUtc": now_utc,
-                            })
+            if indices_data is not None:
+                idx_list = indices_data if isinstance(indices_data, list) else indices_data.get("rows", [])
+                for idx in idx_list:
+                    code = str(idx.get("code") or idx.get("symbol") or idx.get("Index") or idx.get("index") or "").upper()
+                    cur_raw = idx.get("current") or idx.get("Current") or idx.get("value") or 0.0
+                    cur = float(cur_raw or 0.0)
+                    if code and cur > 0:
+                        ingest_indices.append({
+                            "code": code,
+                            "current": cur,
+                            "change": float(idx.get("change") or idx.get("Change") or 0.0),
+                            "changePercent": float(idx.get("percentChange") or idx.get("% Change") or 0.0),
+                            "volume": int(float(idx.get("volume") or idx.get("Volume") or 0)),
+                            "tradingDate": trading_date,
+                            "fetchedAtUtc": now_utc,
+                        })
 
-                    if not dry_run and idx_list and not is_duplicate:
-                        rel_path, comp_bytes, _, _ = self.archive_manager.stage_locally(
-                            source="psx-dps",
-                            endpoint="indices",
-                            trading_date=trading_date,
-                            data=indices_data,
-                        )
+                if not dry_run and idx_list and not is_duplicate:
+                    rel_path, comp_bytes, _, _ = self.archive_manager.stage_locally(
+                        source="psx-dps",
+                        endpoint="indices",
+                        trading_date=trading_date,
+                        data=indices_data,
+                    )
+                    try:
                         self.archive_manager.commit_file_to_archive(
                             rel_path=rel_path,
                             content_bytes=comp_bytes,
                             commit_message=f"data(indices): {trading_date}",
                         )
                         archived_files.append(rel_path)
-                except Exception as e:
-                    logger.warning("Non-fatal: indices fetch failed: %s", e)
+                    except (ArchiveCommitError, ArchiveCredentialsError) as e:
+                        logger.error("Durable archive failure while saving indices: %s", e)
+                        msg = f"Archive failure for indices: {e}"
+                        self.healthchecks.ping_fail(msg)
+                        return {
+                            "runId": run_id,
+                            "status": "PARTIAL_ARCHIVE_FAILED",
+                            "error": str(e),
+                            "archivedFiles": archived_files,
+                            "tradingDate": trading_date,
+                        }
 
             # 8. EOD Settlement Reconciliation (during post-close window or if force_eod)
             reconciliation_summary: Optional[Dict[str, Any]] = None
@@ -291,7 +318,18 @@ class CollectorPipeline:
             }
 
             if not dry_run and archived_files:
-                self.archive_manager.commit_daily_manifest(trading_date, manifest_payload)
+                try:
+                    self.archive_manager.commit_daily_manifest(trading_date, manifest_payload)
+                except (ArchiveCommitError, ArchiveCredentialsError) as e:
+                    logger.error("Durable daily manifest commit failed: %s", e)
+                    self.healthchecks.ping_fail(f"Daily manifest commit failure: {e}")
+                    return {
+                        "runId": run_id,
+                        "status": "ARCHIVE_FAILED",
+                        "error": str(e),
+                        "archivedFiles": archived_files,
+                        "tradingDate": trading_date,
+                    }
 
             # 10. Ingest to Cloudflare API (if API configured and reachable)
             ingest_payload = {

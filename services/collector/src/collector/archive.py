@@ -159,6 +159,13 @@ class DurableArchiveManager:
             if existing_bytes == content_bytes:
                 logger.info("File already durably archived with identical content: %s", rel_path)
                 return True
+            # Enforce immutability for raw archive objects
+            if rel_path.startswith("raw/"):
+                raise ArchiveCommitError(
+                    f"Immutability violation: raw archive object {rel_path} already exists with differing content "
+                    f"({len(existing_bytes)} bytes existing vs {len(content_bytes)} bytes incoming). "
+                    f"Raw archive objects are strictly immutable and cannot be overwritten."
+                )
             logger.info("File exists with different content; updating: %s", rel_path)
 
         url = f"https://api.github.com/repos/{self.repo_name}/contents/{rel_path}"
@@ -211,30 +218,58 @@ class DurableArchiveManager:
         accumulates verifiedArchiveFiles and cycles without erasing earlier collections.
         """
         rel_path = f"manifests/{trading_date}.json"
+        new_files = manifest_data.get("verifiedArchiveFiles", [])
+        new_cycle = {
+            "generatedAtUtc": manifest_data.get("generatedAtUtc"),
+            "source": manifest_data.get("source"),
+            "files": new_files,
+            "totalBars": manifest_data.get("totalBars", 0),
+            "totalSnapshots": manifest_data.get("totalSnapshots", 0),
+            "totalIndices": manifest_data.get("totalIndices", 0),
+            "payloadSha256": manifest_data.get("payloadSha256"),
+        }
 
         # Read existing manifest if present to accumulate references across runs
         existing_bytes, _ = self.read_remote_file(rel_path, retries=1)
         if existing_bytes:
             try:
                 existing_manifest = json.loads(existing_bytes.decode("utf-8"))
+                if not isinstance(existing_manifest, dict):
+                    raise ValueError("Existing manifest content is not a valid JSON dictionary")
                 # Merge verified files
                 existing_files = existing_manifest.get("verifiedArchiveFiles", [])
-                new_files = manifest_data.get("verifiedArchiveFiles", [])
+                if not isinstance(existing_files, list):
+                    raise ValueError("Existing manifest has invalid verifiedArchiveFiles structure")
                 manifest_data["verifiedArchiveFiles"] = sorted(list(set(existing_files + new_files)))
                 # Preserve run cycle history
                 existing_cycles = existing_manifest.get("cycles", [])
-                new_cycle = {
-                    "generatedAtUtc": manifest_data.get("generatedAtUtc"),
-                    "source": manifest_data.get("source"),
-                    "files": new_files,
-                    "totalBars": manifest_data.get("totalBars", 0),
-                    "totalSnapshots": manifest_data.get("totalSnapshots", 0),
-                    "totalIndices": manifest_data.get("totalIndices", 0),
-                    "payloadSha256": manifest_data.get("payloadSha256"),
-                }
+                if not isinstance(existing_cycles, list):
+                    existing_cycles = []
                 manifest_data["cycles"] = existing_cycles + [new_cycle]
             except Exception as e:
-                logger.warning("Error parsing existing manifest for accumulation: %s", e)
+                # Corrupt manifest must FAIL CLOSED and preserve corrupted data
+                corrupt_backup = f"manifests/corrupted_{trading_date}_{int(time.time())}.json"
+                logger.error(
+                    "Existing manifest %s is corrupt or unreadable: %s. Preserving corrupted state to %s and failing closed.",
+                    rel_path,
+                    e,
+                    corrupt_backup,
+                )
+                try:
+                    full_corrupt_local = os.path.join(self.local_archive_dir, corrupt_backup)
+                    os.makedirs(os.path.dirname(full_corrupt_local), exist_ok=True)
+                    with open(full_corrupt_local, "wb") as f:
+                        f.write(existing_bytes)
+                except Exception as backup_err:
+                    logger.error("Failed to write local backup of corrupted manifest: %s", backup_err)
+                raise ArchiveCommitError(
+                    f"Corrupt or unreadable existing manifest at {rel_path}: {e}. "
+                    f"Commit aborted to protect historical records from being discarded."
+                )
+        else:
+            # First collection cycle for this trading date: ensure represented in cycles ledger
+            manifest_data["verifiedArchiveFiles"] = sorted(list(set(new_files)))
+            manifest_data["cycles"] = [new_cycle]
 
         manifest_bytes = json.dumps(manifest_data, indent=2, sort_keys=True).encode("utf-8")
 

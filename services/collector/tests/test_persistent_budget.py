@@ -237,3 +237,156 @@ def test_lease_renewal_lifecycle(tmp_path):
     assert runner.is_lease_active() is True
     runner.release_lease()
 
+
+def test_reservation_near_exhaustion_249_and_250(tmp_path):
+    """
+    Proves Item 4: Tests boundary condition at exactly 249/250 and 250/250.
+    The 250th request succeeds (hitting the cap). The 251st request must be rejected.
+    """
+    state_file = str(tmp_path / "budget_exhaustion.json")
+    coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250, require_remote=False)
+    coordinator.runner_id = "runner-exhaustion-test"
+    coordinator.acquire_lease_and_sync()
+
+    # Pre-populate history with 249 requests
+    now = datetime.now(timezone.utc)
+    coordinator.history = [
+        {"timestamp": (now - timedelta(minutes=i)).isoformat(), "endpoint": f"req-{i}", "runner_id": "prior-runner", "status": "RESERVED"}
+        for i in range(249)
+    ]
+    coordinator._save_local_state({
+        "history": coordinator.history,
+        "lease": coordinator.active_lease,
+        "cooldown_until": None,
+        "snapshot_hashes": {},
+    })
+
+    assert coordinator.get_remaining_requests() == 1
+
+    # 250th request: Must SUCCEED (249 -> 250)
+    coordinator.reserve_request("endpoint-250")
+    assert coordinator.get_remaining_requests() == 0
+
+    # 251st request: Must FAIL CLOSED with BudgetExceededError
+    with pytest.raises(BudgetExceededError) as exc_info:
+        coordinator.reserve_request("endpoint-251")
+    assert "limit (250) reached" in str(exc_info.value)
+
+
+def test_quota_rechecked_after_concurrency_conflict_merge_exceeds_cap():
+    """
+    Proves Item 4: When an HTTP 409 conflict occurs and merged history pushes
+    the total rolling count above the cap, save_remote_state must recheck and raise BudgetExceededError.
+    """
+    coord = PersistentCoordinator(token="test-token", repo_name="test/repo", daily_limit=250, require_remote=True)
+    coord.runner_id = "runner-merge-test"
+    now = datetime.now(timezone.utc)
+
+    # Local attempt has 130 requests
+    local_history = [
+        {"timestamp": (now - timedelta(minutes=i)).isoformat(), "endpoint": f"local-{i}", "runner_id": "runner-merge-test", "status": "RESERVED"}
+        for i in range(130)
+    ]
+    local_state = {
+        "history": local_history,
+        "lease": {"owner": "runner-merge-test", "acquired_at": now.isoformat(), "expires_at": (now + timedelta(seconds=300)).isoformat()},
+        "cooldown_until": None,
+        "snapshot_hashes": {},
+    }
+
+    # Fresh remote state committed by another runner in parallel has 125 distinct requests (130 + 125 = 255 > 250)
+    remote_history = [
+        {"timestamp": (now - timedelta(hours=1, minutes=i)).isoformat(), "endpoint": f"remote-{i}", "runner_id": "runner-parallel", "status": "RESERVED"}
+        for i in range(125)
+    ]
+    fresh_remote_state = {
+        "history": remote_history,
+        "lease": {"owner": "runner-merge-test", "acquired_at": now.isoformat(), "expires_at": (now + timedelta(seconds=300)).isoformat()},
+        "cooldown_until": None,
+        "snapshot_hashes": {},
+    }
+    b64_fresh = base64.b64encode(json.dumps(fresh_remote_state).encode("utf-8")).decode("utf-8")
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        # 1st PUT -> 409 Conflict
+        mock_conflict = urllib.error.HTTPError("url", 409, "Conflict", {}, None)
+
+        # Reload GET -> returns fresh state
+        mock_reload = MagicMock(status=200)
+        mock_reload.read.return_value = json.dumps({"sha": "sha-fresh", "content": b64_fresh}).encode("utf-8")
+        mock_reload.__enter__.return_value = mock_reload
+
+        mock_urlopen.side_effect = [mock_conflict, mock_reload]
+
+        # Must raise BudgetExceededError after merging history because 255 > 250
+        with pytest.raises(BudgetExceededError) as exc_info:
+            coord.save_remote_state(local_state, max_retries=2)
+        assert "exceeded after merging concurrent runner requests" in str(exc_info.value)
+
+
+def test_authoritative_lease_verification_blocks_stale_or_hijacked_runner(tmp_path):
+    """
+    Proves Item 4: Loading state never replaces active_lease with another runner's lease.
+    If another runner took over the lease, reserve_request detects lack of ownership and fails closed.
+    """
+    state_file = str(tmp_path / "budget_state.json")
+    runner_orig = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=10, require_remote=False)
+    runner_orig.runner_id = "runner-orig"
+    runner_orig.acquire_lease_and_sync()
+
+    # Another runner claims lease (simulating takeover after expiration)
+    runner_new = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=300, require_remote=False)
+    runner_new.runner_id = "runner-new"
+
+    with patch("collector.persistent_budget.datetime") as mock_dt:
+        future_time = datetime.now(timezone.utc) + timedelta(seconds=20)
+        mock_dt.now.return_value = future_time
+        mock_dt.fromisoformat = datetime.fromisoformat
+
+        runner_new.acquire_lease_and_sync()
+        assert runner_new.is_lease_active() is True
+
+    # Now runner_orig tries to reserve a request: must fail closed because lease belongs to runner-new
+    with pytest.raises(LeaseConflictError) as exc_info:
+        runner_orig.reserve_request("market-watch")
+    assert "lost or does not hold lease ownership" in str(exc_info.value)
+    assert runner_orig.active_lease is None
+
+
+def test_deterministic_multi_client_concurrency_without_mocks(tmp_path):
+    """
+    Proves Item 4: Deterministic concurrency test with independent coordinator clients
+    operating on shared state without using mocks.
+    """
+    state_file = str(tmp_path / "shared_persistent_state.json")
+
+    client_a = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=300, require_remote=False)
+    client_a.runner_id = "client-alpha"
+
+    client_b = PersistentCoordinator(token=None, local_state_file=state_file, lease_ttl_seconds=300, require_remote=False)
+    client_b.runner_id = "client-beta"
+
+    # Client A acquires lease cleanly
+    client_a.acquire_lease_and_sync()
+    assert client_a.is_lease_active() is True
+
+    # Client B attempts to acquire lease simultaneously -> rejected
+    with pytest.raises(LeaseConflictError) as exc_info:
+        client_b.acquire_lease_and_sync()
+    assert "currently held by client-alpha" in str(exc_info.value)
+    assert client_b.is_lease_active() is False
+
+    # Client A pre-reserves requests
+    client_a.reserve_request("indices")
+    client_a.reserve_request("snapshot")
+
+    # Client A releases lease cleanly
+    client_a.release_lease()
+    assert client_a.is_lease_active() is False
+
+    # Now Client B can acquire the lease and see the 2 requests preserved in shared state
+    client_b.acquire_lease_and_sync()
+    assert client_b.is_lease_active() is True
+    assert client_b.get_remaining_requests() == 248  # 250 - 2
+    client_b.release_lease()
+

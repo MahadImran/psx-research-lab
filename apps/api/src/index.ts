@@ -229,12 +229,13 @@ app.get('/v1/indices/:code', async (c) => {
 
 // Protected Ingestion Endpoint (Requires Cloudflare Access token + HMAC + Durable Replay Nonce + D1 Persistence)
 app.post('/v1/admin/ingest', async (c) => {
-  // 1. Verify Cloudflare Access (Fails closed if credentials configured or requireAccess)
+  // 1. Verify Cloudflare Access (Fails closed by default if credentials missing or invalid)
   const accessClientId = c.env?.CLOUDFLARE_CLIENT_ID || c.env?.CF_ACCESS_CLIENT_ID;
   const accessClientSecret = c.env?.CLOUDFLARE_CLIENT_SECRET || c.env?.CF_ACCESS_CLIENT_SECRET;
   const accessCheck = await verifyCloudflareAccess(c.req.raw, {
     accessClientId,
     accessClientSecret,
+    requireAccess: true,
   });
   if (!accessCheck.valid) {
     return c.json({ error: 'Forbidden', reason: accessCheck.reason }, 403);
@@ -282,10 +283,27 @@ app.post('/v1/admin/ingest', async (c) => {
 
     const { manifest, bars, snapshot, indices, collectorRunId } = parsed.data;
     const db = c.env.DB;
-    const statements: D1PreparedStatement[] = [];
 
-    // Record raw ingestion audit
-    statements.push(
+    // Idempotency check: If this ingestion was already processed and verified, return existing status
+    const existingIngest = await db
+      .prepare('SELECT status FROM raw_ingestions WHERE ingestion_id = ?')
+      .bind(collectorRunId)
+      .first<{ status: string }>();
+
+    if (existingIngest && existingIngest.status === 'ACCEPTED') {
+      return c.json({
+        status: 'ACCEPTED',
+        batchId: collectorRunId,
+        message: 'Ingestion already committed and verified (idempotent)',
+        processedBars: bars.length,
+        processedSnapshotObservations: snapshot?.observations.length || 0,
+      });
+    }
+
+    const stagingStatements: D1PreparedStatement[] = [];
+
+    // 1. Audit Staging Record: Initially inserted as 'STAGING'
+    stagingStatements.push(
       db.prepare(
         `INSERT OR REPLACE INTO raw_ingestions (ingestion_id, source, trading_date, sha256, archive_path, status, records_count, fetched_at_utc)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -295,18 +313,18 @@ app.post('/v1/admin/ingest', async (c) => {
         manifest.tradingDate,
         manifest.payloadSha256,
         manifest.archivePath || null,
-        'ACCEPTED',
+        'STAGING',
         bars.length + (snapshot?.observations.length || 0),
         manifest.generatedAtUtc
       )
     );
 
-    // Upsert daily bars
+    // 2. Stage daily bars with is_active = 0 (unverified until whole transaction completes)
     for (const bar of bars) {
-      statements.push(
+      stagingStatements.push(
         db.prepare(
           `INSERT OR REPLACE INTO daily_bars (source, symbol, trading_date, revision, open, high, low, close, volume, is_quarantined, quarantine_reason, data_grade, payload_sha256, fetched_at_utc, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
         ).bind(
           bar.source,
           bar.symbol,
@@ -326,12 +344,12 @@ app.post('/v1/admin/ingest', async (c) => {
       );
     }
 
-    // Upsert snapshot observations if present
+    // 3. Stage snapshot observations with is_active = 0
     if (snapshot) {
-      statements.push(
+      stagingStatements.push(
         db.prepare(
           `INSERT OR REPLACE INTO snapshots (batch_id, source, trading_date, raw_sha256, symbols_count, fetched_at_utc, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, 1)`
+           VALUES (?, ?, ?, ?, ?, ?, 0)`
         ).bind(
           snapshot.batchId,
           snapshot.source,
@@ -343,7 +361,7 @@ app.post('/v1/admin/ingest', async (c) => {
       );
 
       for (const obs of snapshot.observations) {
-        statements.push(
+        stagingStatements.push(
           db.prepare(
             `INSERT OR REPLACE INTO snapshot_observations (batch_id, symbol, current_price, change_value, change_percent, volume, high, low)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -361,9 +379,9 @@ app.post('/v1/admin/ingest', async (c) => {
       }
     }
 
-    // Upsert index history
+    // 4. Upsert index history
     for (const idx of indices) {
-      statements.push(
+      stagingStatements.push(
         db.prepare(
           `INSERT OR REPLACE INTO index_history (code, trading_date, current_value, change_value, change_percent, volume, fetched_at_utc)
            VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -379,20 +397,56 @@ app.post('/v1/admin/ingest', async (c) => {
       );
     }
 
-    // 7. Transactional Batch Execution: Fail closed if ANY statement in batch fails
+    // 5. Multi-Batch Staging Execution: Fail closed if ANY statement in any batch fails
     try {
       const chunkSize = 90;
-      for (let i = 0; i < statements.length; i += chunkSize) {
-        await db.batch(statements.slice(i, i + chunkSize));
+      for (let i = 0; i < stagingStatements.length; i += chunkSize) {
+        await db.batch(stagingStatements.slice(i, i + chunkSize));
       }
     } catch (batchErr: any) {
+      // Mark ingestion failed so incomplete data is never published
+      await db
+        .prepare('UPDATE raw_ingestions SET status = ? WHERE ingestion_id = ?')
+        .bind('FAILED', collectorRunId)
+        .run()
+        .catch(() => {});
+
       return c.json({
         error: 'Persistence Error',
-        reason: 'Database transaction batch failed: ' + batchErr.message,
+        reason: 'Database staging batch failed (all records held in unverified state): ' + batchErr.message,
       }, 500);
     }
 
-    // 8. Cache manifest in KV if KV binding available
+    // 6. Publication Phase: Atomically activate staged data and mark ingestion ACCEPTED
+    try {
+      const publishStatements: D1PreparedStatement[] = [
+        // Activate daily bars staged for this ingestion
+        db.prepare(
+          `UPDATE daily_bars SET is_active = 1 WHERE payload_sha256 = ? AND is_active = 0`
+        ).bind(manifest.payloadSha256),
+        // Mark raw ingestion ACCEPTED
+        db.prepare(
+          `UPDATE raw_ingestions SET status = 'ACCEPTED' WHERE ingestion_id = ?`
+        ).bind(collectorRunId),
+      ];
+
+      if (snapshot) {
+        publishStatements.push(
+          db.prepare(
+            `UPDATE snapshots SET is_active = 1 WHERE batch_id = ? AND is_active = 0`
+          ).bind(snapshot.batchId)
+        );
+      }
+
+      await db.batch(publishStatements);
+    } catch (publishErr: any) {
+      return c.json({
+        error: 'Publication Error',
+        reason: 'Staging succeeded but atomic publication failed: ' + publishErr.message,
+      }, 500);
+    }
+
+    // 7. Cache manifest in KV only after atomic publication completes
     if (c.env?.KV) {
       await c.env.KV.put('latest_manifest', JSON.stringify(manifest));
       await c.env.KV.put('last_ingest_utc', new Date().toISOString());

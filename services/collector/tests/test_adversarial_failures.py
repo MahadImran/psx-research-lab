@@ -263,8 +263,8 @@ def test_same_day_collection_collision_preserves_all_files(tmp_path):
     for f in files_added:
         assert f in final_manifest["verifiedArchiveFiles"]
     assert len(final_manifest["verifiedArchiveFiles"]) == 3
-    # All earlier cycles must be preserved in cycles array
-    assert len(final_manifest.get("cycles", [])) == 2  # Cycles 1 and 2 preserved prior to cycle 3
+    # All 3 cycles must be preserved in cycles array
+    assert len(final_manifest.get("cycles", [])) == 3  # All 3 cycles preserved in history
 
 
 def test_lease_expiration_mid_execution_blocks_requests(tmp_path):

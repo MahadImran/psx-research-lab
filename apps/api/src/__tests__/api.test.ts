@@ -112,14 +112,70 @@ describe('API Routes & Security', () => {
     expect(body.notice).toContain('local application budget');
   });
 
-  it('POST /v1/admin/ingest fails closed (500) when INGEST_HMAC_SECRET is missing', async () => {
+  const VALID_ACCESS_CLIENT_ID = 'test-cf-client-id';
+  const VALID_ACCESS_CLIENT_SECRET = 'test-cf-client-secret';
+
+  const defaultAccessHeaders = {
+    'CF-Access-Client-Id': VALID_ACCESS_CLIENT_ID,
+    'CF-Access-Client-Secret': VALID_ACCESS_CLIENT_SECRET,
+  };
+
+  const baseMockEnv = {
+    CLOUDFLARE_CLIENT_ID: VALID_ACCESS_CLIENT_ID,
+    CLOUDFLARE_CLIENT_SECRET: VALID_ACCESS_CLIENT_SECRET,
+    INGEST_HMAC_SECRET: TEST_SECRET,
+  };
+
+  it('POST /v1/admin/ingest fails closed (403) when Cloudflare Access credentials are not configured on server', async () => {
+    // Missing CLOUDFLARE_CLIENT_ID & SECRET in env
+    const res = await app.request('/v1/admin/ingest', {
+      method: 'POST',
+      headers: defaultAccessHeaders,
+      body: JSON.stringify({ test: 123 }),
+    }, {
+      INGEST_HMAC_SECRET: TEST_SECRET,
+    });
+    expect(res.status).toBe(403);
+    const data = (await res.json()) as any;
+    expect(data.reason).toContain('fail closed');
+  });
+
+  it('POST /v1/admin/ingest fails closed (403) when Cloudflare Access request headers are missing', async () => {
     const res = await app.request('/v1/admin/ingest', {
       method: 'POST',
       body: JSON.stringify({ test: 123 }),
+    }, baseMockEnv);
+    expect(res.status).toBe(403);
+    const data = (await res.json()) as any;
+    expect(data.reason).toContain('Missing Cloudflare Access service token');
+  });
+
+  it('POST /v1/admin/ingest fails closed (403) when Cloudflare Access credentials are invalid', async () => {
+    const res = await app.request('/v1/admin/ingest', {
+      method: 'POST',
+      headers: {
+        'CF-Access-Client-Id': 'wrong-id',
+        'CF-Access-Client-Secret': 'wrong-secret',
+      },
+      body: JSON.stringify({ test: 123 }),
+    }, baseMockEnv);
+    expect(res.status).toBe(403);
+    const data = (await res.json()) as any;
+    expect(data.reason).toContain('Invalid Cloudflare Access service token');
+  });
+
+  it('POST /v1/admin/ingest fails closed (500) when INGEST_HMAC_SECRET is missing on server', async () => {
+    const res = await app.request('/v1/admin/ingest', {
+      method: 'POST',
+      headers: defaultAccessHeaders,
+      body: JSON.stringify({ test: 123 }),
+    }, {
+      CLOUDFLARE_CLIENT_ID: VALID_ACCESS_CLIENT_ID,
+      CLOUDFLARE_CLIENT_SECRET: VALID_ACCESS_CLIENT_SECRET,
     });
     expect(res.status).toBe(500);
     const data = (await res.json()) as any;
-    expect(data.reason).toContain('fail closed');
+    expect(data.reason).toContain('INGEST_HMAC_SECRET is not configured');
   });
 
   it('POST /v1/admin/ingest rejects requests missing HMAC headers', async () => {
@@ -127,9 +183,10 @@ describe('API Routes & Security', () => {
       '/v1/admin/ingest',
       {
         method: 'POST',
+        headers: defaultAccessHeaders,
         body: JSON.stringify({ test: 123 }),
       },
-      { INGEST_HMAC_SECRET: TEST_SECRET }
+      baseMockEnv
     );
     expect(res.status).toBe(401);
   });
@@ -146,20 +203,21 @@ describe('API Routes & Security', () => {
       {
         method: 'POST',
         headers: {
+          ...defaultAccessHeaders,
           'X-Ingest-Signature': sig,
           'X-Ingest-Timestamp': staleTimestamp.toString(),
           'X-Ingest-Nonce': nonce,
         },
         body,
       },
-      { INGEST_HMAC_SECRET: TEST_SECRET }
+      baseMockEnv
     );
     expect(res.status).toBe(401);
     const data = (await res.json()) as any;
     expect(data.reason).toContain('300-second window');
   });
 
-  it('POST /v1/admin/ingest fails closed (500) if D1 database binding is missing', async () => {
+  it('POST /v1/admin/ingest fails closed (401) if D1 database binding is missing for nonce persistence', async () => {
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = 'nonce-no-db-12345';
     const payload = {
@@ -188,6 +246,7 @@ describe('API Routes & Security', () => {
       {
         method: 'POST',
         headers: {
+          ...defaultAccessHeaders,
           'X-Ingest-Signature': sig,
           'X-Ingest-Timestamp': timestamp.toString(),
           'X-Ingest-Nonce': nonce,
@@ -195,16 +254,16 @@ describe('API Routes & Security', () => {
         body,
       },
       {
-        INGEST_HMAC_SECRET: TEST_SECRET,
+        ...baseMockEnv,
         KV: createMockKV(),
       }
     );
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(401);
     const data = (await res.json()) as any;
     expect(data.reason).toContain('D1 Database binding required');
   });
 
-  it('POST /v1/admin/ingest detects and blocks nonce replay attacks', async () => {
+  it('POST /v1/admin/ingest detects and blocks nonce replay attacks atomically via D1', async () => {
     const mockDb = createMockDB();
     const mockKv = createMockKV();
     const timestamp = Math.floor(Date.now() / 1000);
@@ -231,7 +290,7 @@ describe('API Routes & Security', () => {
     const sig = await computeHmac(message, TEST_SECRET);
 
     const mockEnv = {
-      INGEST_HMAC_SECRET: TEST_SECRET,
+      ...baseMockEnv,
       DB: mockDb,
       KV: mockKv,
     };
@@ -242,6 +301,7 @@ describe('API Routes & Security', () => {
       {
         method: 'POST',
         headers: {
+          ...defaultAccessHeaders,
           'X-Ingest-Signature': sig,
           'X-Ingest-Timestamp': timestamp.toString(),
           'X-Ingest-Nonce': duplicateNonce,
@@ -258,6 +318,7 @@ describe('API Routes & Security', () => {
       {
         method: 'POST',
         headers: {
+          ...defaultAccessHeaders,
           'X-Ingest-Signature': sig,
           'X-Ingest-Timestamp': timestamp.toString(),
           'X-Ingest-Nonce': duplicateNonce,
@@ -271,24 +332,40 @@ describe('API Routes & Security', () => {
     expect(data.reason).toContain('replay attack detected');
   });
 
-  it('POST /v1/admin/ingest validates Cloudflare Access service token headers', async () => {
+  it('POST /v1/admin/ingest stages records then atomically publishes them (two-phase commit)', async () => {
     const mockDb = createMockDB();
     const timestamp = Math.floor(Date.now() / 1000);
-    const nonce = 'valid-nonce-access-987';
+    const nonce = 'two-phase-nonce-123';
     const payload = {
       manifest: {
         manifestVersion: '1.0.0',
         generatedAtUtc: new Date().toISOString(),
         tradingDate: '2026-10-30',
         source: 'psx-dps',
-        totalBars: 0,
+        totalBars: 1,
         totalSnapshots: 0,
         totalIndices: 0,
-        payloadSha256: 'd'.repeat(64),
+        payloadSha256: 'c'.repeat(64),
       },
-      bars: [],
+      bars: [
+        {
+          source: 'psx-dps',
+          symbol: 'SYS',
+          tradingDate: '2026-10-30',
+          revision: 0,
+          open: 450.0,
+          high: 460.0,
+          low: 445.0,
+          close: 455.0,
+          volume: 50000,
+          isQuarantined: false,
+          dataGrade: 'GRADE_A',
+          hash: 'c'.repeat(64),
+          fetchedAtUtc: new Date().toISOString(),
+        },
+      ],
       indices: [],
-      collectorRunId: 'test-run-cf-access',
+      collectorRunId: 'test-run-staging-publish',
       timestamp,
       nonce,
     };
@@ -297,19 +374,17 @@ describe('API Routes & Security', () => {
     const sig = await computeHmac(message, TEST_SECRET);
 
     const mockEnv = {
-      CLOUDFLARE_CLIENT_ID: 'test-cf-client-id',
-      CLOUDFLARE_CLIENT_SECRET: 'test-cf-client-secret',
-      INGEST_HMAC_SECRET: TEST_SECRET,
+      ...baseMockEnv,
       DB: mockDb,
       KV: createMockKV(),
     };
 
-    // 1. Missing CF-Access headers
-    const resForbidden = await app.request(
+    const res = await app.request(
       '/v1/admin/ingest',
       {
         method: 'POST',
         headers: {
+          ...defaultAccessHeaders,
           'X-Ingest-Signature': sig,
           'X-Ingest-Timestamp': timestamp.toString(),
           'X-Ingest-Nonce': nonce,
@@ -318,24 +393,28 @@ describe('API Routes & Security', () => {
       },
       mockEnv
     );
-    expect(resForbidden.status).toBe(403);
+    expect(res.status).toBe(200);
 
-    // 2. Presenting valid CF-Access headers
-    const resAllowed = await app.request(
+    // Verify idempotent re-ingest
+    const nonce2 = 'two-phase-nonce-456';
+    const message2 = `${timestamp}.${nonce2}.${body}`;
+    const sig2 = await computeHmac(message2, TEST_SECRET);
+    const resIdempotent = await app.request(
       '/v1/admin/ingest',
       {
         method: 'POST',
         headers: {
-          'CF-Access-Client-Id': 'test-cf-client-id',
-          'CF-Access-Client-Secret': 'test-cf-client-secret',
-          'X-Ingest-Signature': sig,
+          ...defaultAccessHeaders,
+          'X-Ingest-Signature': sig2,
           'X-Ingest-Timestamp': timestamp.toString(),
-          'X-Ingest-Nonce': nonce,
+          'X-Ingest-Nonce': nonce2,
         },
         body,
       },
       mockEnv
     );
-    expect(resAllowed.status).toBe(200);
+    expect(resIdempotent.status).toBe(200);
+    const idempotentData = (await resIdempotent.json()) as any;
+    expect(idempotentData.message).toContain('idempotent');
   });
 });

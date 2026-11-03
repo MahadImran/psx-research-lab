@@ -161,7 +161,7 @@ def test_archive_manager_cumulative_manifest_merging(tmp_path):
     m1_bytes, _ = mgr.read_remote_file(manifest_rel)
     m1 = json.loads(m1_bytes.decode("utf-8"))
     assert m1["verifiedArchiveFiles"] == ["raw/2026/11/02/snapshot_043000Z.json.gz"]
-    assert len(m1.get("cycles", [])) == 0  # 1st cycle doesn't have existing prior cycles
+    assert len(m1.get("cycles", [])) == 1  # 1st cycle is represented in cycle ledger
 
     # Cycle 2: Afternoon collection on same trading day
     c2_payload = {
@@ -185,5 +185,73 @@ def test_archive_manager_cumulative_manifest_merging(tmp_path):
     assert "raw/2026/11/02/snapshot_043000Z.json.gz" in m2["verifiedArchiveFiles"]
     assert "raw/2026/11/02/eod_reconciled_093000Z.json.gz" in m2["verifiedArchiveFiles"]
     assert len(m2["verifiedArchiveFiles"]) == 2
-    assert len(m2.get("cycles", [])) == 1  # Cycle 1 preserved in history
+    assert len(m2.get("cycles", [])) == 2  # Both cycles 1 and 2 preserved in history
+
+
+def test_raw_archive_object_immutability_rejects_content_change():
+    """
+    Proves Item 1: Raw archive objects under raw/ are strictly immutable.
+    Attempting to overwrite an existing path with differing content must raise ArchiveCommitError.
+    """
+    mgr = DurableArchiveManager(token="test-token", repo_name="test/repo", require_remote=True)
+    rel_path = "raw/2026/11/02/test_snapshot.json.gz"
+
+    content_v1 = b"original-raw-content"
+    content_v2 = b"different-modified-content"
+
+    with patch.object(mgr, "read_remote_file") as mock_read:
+        # File already exists with content_v1
+        mock_read.return_value = (content_v1, "sha-v1")
+
+        # Attempt to write content_v2 must raise ArchiveCommitError
+        with pytest.raises(ArchiveCommitError) as exc_info:
+            mgr.commit_file_to_archive(rel_path, content_v2, "attempted overwrite")
+        assert "Immutability violation" in str(exc_info.value)
+        assert "strictly immutable" in str(exc_info.value)
+
+
+def test_corrupt_manifest_fails_closed_and_preserves_backup(tmp_path):
+    """
+    Proves Item 1: Unreadable or corrupt manifests must fail closed, preserve a backup
+    of the corrupt payload for recovery, and never overwrite the manifest with incomplete state.
+    """
+    local_dir = str(tmp_path / "archive")
+    mgr = DurableArchiveManager(token=None, local_archive_dir=local_dir, require_remote=False)
+    trading_date = "2026-11-02"
+    manifest_rel = f"manifests/{trading_date}.json"
+
+    # Write corrupt unparseable JSON to existing manifest location
+    full_manifest_path = os.path.join(local_dir, manifest_rel)
+    os.makedirs(os.path.dirname(full_manifest_path), exist_ok=True)
+    corrupt_bytes = b'{"manifestVersion": "1.0.0", "corrupt_truncated_json": '
+    with open(full_manifest_path, "wb") as f:
+        f.write(corrupt_bytes)
+
+    # Attempting to commit a new manifest must fail closed
+    new_payload = {
+        "manifestVersion": "1.0.0",
+        "generatedAtUtc": "2026-11-02T10:00:00Z",
+        "tradingDate": trading_date,
+        "source": "psx-dps",
+        "totalBars": 10,
+        "totalSnapshots": 100,
+        "totalIndices": 18,
+        "payloadSha256": "hash-new",
+        "verifiedArchiveFiles": ["raw/2026/11/02/new_data.json.gz"],
+    }
+
+    with pytest.raises(ArchiveCommitError) as exc_info:
+        mgr.commit_daily_manifest(trading_date, new_payload)
+
+    assert "Corrupt or unreadable existing manifest" in str(exc_info.value)
+
+    # Verify corrupt file was preserved (not overwritten by incomplete new_payload)
+    with open(full_manifest_path, "rb") as f:
+        assert f.read() == corrupt_bytes
+
+    # Verify a corrupted backup copy was saved in manifests/ directory
+    manifests_dir = os.path.join(local_dir, "manifests")
+    files = os.listdir(manifests_dir)
+    corrupted_backups = [f for f in files if f.startswith(f"corrupted_{trading_date}")]
+    assert len(corrupted_backups) >= 1
 

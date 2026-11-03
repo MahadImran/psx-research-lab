@@ -58,6 +58,8 @@ class PersistentCoordinator:
         self._file_sha: Optional[str] = None
         self.history: List[Dict[str, str]] = []
         self.active_lease: Optional[Dict[str, Any]] = None
+        self.remote_lease: Optional[Dict[str, Any]] = None
+        self.snapshot_hashes: Dict[str, str] = {}
         self.cooldown_until: Optional[str] = None
 
     def _get_headers(self) -> Dict[str, str]:
@@ -103,8 +105,23 @@ class PersistentCoordinator:
                 content = base64.b64decode(data.get("content", "")).decode("utf-8")
                 parsed = json.loads(content)
                 self.history = parsed.get("history", [])
-                self.active_lease = parsed.get("lease")
+                self.snapshot_hashes = parsed.get("snapshot_hashes", {})
+                self.remote_lease = parsed.get("lease")
                 self.cooldown_until = parsed.get("cooldown_until")
+
+                # Authoritative revalidation: NEVER set active_lease to another runner's lease
+                now = datetime.now(timezone.utc)
+                if self.remote_lease and self.remote_lease.get("owner") == self.runner_id:
+                    try:
+                        expires_at = datetime.fromisoformat(self.remote_lease["expires_at"])
+                        if now < expires_at:
+                            self.active_lease = self.remote_lease
+                        else:
+                            self.active_lease = None
+                    except Exception:
+                        self.active_lease = None
+                else:
+                    self.active_lease = None
                 return parsed
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -165,22 +182,35 @@ class PersistentCoordinator:
                     logger.warning("Concurrent commit conflict (HTTP 409). Reloading fresh state (attempt %d)...", attempt + 1)
                     time.sleep(0.5 * (2 ** attempt))
                     fresh_state = self.load_remote_state()
-                    # Re-check lease validity against fresh state
+                    # Re-check lease validity against fresh authoritative state
                     existing_lease = fresh_state.get("lease")
+                    now = datetime.now(timezone.utc)
                     if existing_lease and state.get("lease"):
-                        now = datetime.now(timezone.utc)
                         expires_at = datetime.fromisoformat(existing_lease["expires_at"])
                         if now < expires_at and existing_lease.get("owner") != self.runner_id:
                             raise LeaseConflictError(f"Lease acquired by competitor {existing_lease.get('owner')} during commit conflict.")
+
                     # Merge history keyed by unique tuple
                     all_history_map = {
                         (h.get("timestamp", ""), h.get("endpoint", ""), h.get("runner_id", "")): h
                         for h in fresh_state.get("history", []) + state.get("history", [])
                     }
-                    now = datetime.now(timezone.utc)
                     cutoff = (now - timedelta(hours=24)).isoformat()
                     merged_history = [h for h in all_history_map.values() if h.get("timestamp", "") >= cutoff]
                     merged_history.sort(key=lambda x: x.get("timestamp", ""))
+
+                    # RECHECK the 250-request limit after merging concurrent state changes!
+                    if len(merged_history) > self.daily_limit:
+                        raise BudgetExceededError(
+                            f"Rolling 24h budget limit ({self.daily_limit}) exceeded after merging concurrent runner requests "
+                            f"({len(merged_history)} requests recorded)!"
+                        )
+
+                    # Merge snapshot hashes
+                    merged_hashes = {**fresh_state.get("snapshot_hashes", {}), **state.get("snapshot_hashes", {})}
+                    state["snapshot_hashes"] = merged_hashes
+                    self.snapshot_hashes = merged_hashes
+
                     state["history"] = merged_history
                     continue
 
@@ -188,6 +218,8 @@ class PersistentCoordinator:
                     raise RemoteStateError(f"Failed to commit remote state (HTTP {e.code}): {err_body}")
                 logger.warning("Failed to commit remote state: HTTP %d %s", e.code, err_body)
                 return self._save_local_state(state)
+            except (LeaseConflictError, BudgetExceededError):
+                raise
             except Exception as e:
                 if self.require_remote:
                     raise RemoteStateError(f"Remote state commit network exception: {e}")
@@ -202,25 +234,71 @@ class PersistentCoordinator:
                 with open(self.local_state_file, "r") as f:
                     data = json.load(f)
                     self.history = data.get("history", [])
-                    self.active_lease = data.get("lease")
+                    self.snapshot_hashes = data.get("snapshot_hashes", {})
+                    self.remote_lease = data.get("lease")
                     self.cooldown_until = data.get("cooldown_until")
+                    now = datetime.now(timezone.utc)
+                    if self.remote_lease and self.remote_lease.get("owner") == self.runner_id:
+                        try:
+                            if now < datetime.fromisoformat(self.remote_lease["expires_at"]):
+                                self.active_lease = self.remote_lease
+                            else:
+                                self.active_lease = None
+                        except Exception:
+                            self.active_lease = None
+                    else:
+                        self.active_lease = None
                     return data
             except Exception as e:
                 logger.warning("Error reading local state: %s", e)
-        return {"history": [], "lease": None, "cooldown_until": None}
+        return {"history": [], "lease": None, "cooldown_until": None, "snapshot_hashes": {}}
 
     def _save_local_state(self, state: Dict[str, Any]) -> bool:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.local_state_file)), exist_ok=True)
+            state["snapshot_hashes"] = self.snapshot_hashes
             with open(self.local_state_file, "w") as f:
                 json.dump(state, f, indent=2)
             self.history = state.get("history", [])
-            self.active_lease = state.get("lease")
+            self.remote_lease = state.get("lease")
             self.cooldown_until = state.get("cooldown_until")
+            now = datetime.now(timezone.utc)
+            if self.remote_lease and self.remote_lease.get("owner") == self.runner_id:
+                try:
+                    if now < datetime.fromisoformat(self.remote_lease["expires_at"]):
+                        self.active_lease = self.remote_lease
+                    else:
+                        self.active_lease = None
+                except Exception:
+                    self.active_lease = None
+            else:
+                self.active_lease = None
             return True
         except Exception as e:
             logger.error("Failed to write local state: %s", e)
             return False
+
+    def get_last_snapshot_hash(self, source: str, trading_date: str) -> Optional[str]:
+        """Returns the last known snapshot SHA-256 for a given source and trading date."""
+        key = f"{source}:{trading_date}"
+        return self.snapshot_hashes.get(key)
+
+    def record_snapshot_hash(self, source: str, trading_date: str, sha256_hash: str) -> None:
+        """Durably records the snapshot SHA-256 for a given source and trading date."""
+        key = f"{source}:{trading_date}"
+        self.snapshot_hashes[key] = sha256_hash
+        if self.token or self.require_remote:
+            state = self.load_remote_state()
+            if "snapshot_hashes" not in state:
+                state["snapshot_hashes"] = {}
+            state["snapshot_hashes"][key] = sha256_hash
+            self.save_remote_state(state)
+        else:
+            state = self._load_local_state()
+            if "snapshot_hashes" not in state:
+                state["snapshot_hashes"] = {}
+            state["snapshot_hashes"][key] = sha256_hash
+            self._save_local_state(state)
 
     def is_lease_active(self) -> bool:
         """Checks if this runner holds a valid, unexpired lease."""
@@ -342,68 +420,55 @@ class PersistentCoordinator:
         """
         Durably reserves an upstream request quota BEFORE the network socket request is made.
         Fails closed: if remote persistence cannot be committed, raises RemoteStateError or
-        BudgetExceededError, and the upstream request must NOT proceed.
+        BudgetExceededError or LeaseConflictError, and the upstream request must NOT proceed.
         """
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=24)).isoformat()
 
-        if not self.is_lease_active():
-            # Refresh state to verify whether lease is still valid
-            fresh_state = self.load_remote_state() if (self.require_remote or self.token) else self._load_local_state()
-            current_lease = fresh_state.get("lease")
-            if not current_lease or current_lease.get("owner") != self.runner_id:
-                raise LeaseConflictError(
-                    f"Runner {self.runner_id} lost lease ownership. Cannot issue upstream request for {endpoint}."
-                )
-            if now >= datetime.fromisoformat(current_lease["expires_at"]):
-                raise LeaseConflictError(
-                    f"Runner {self.runner_id} lease expired at {current_lease['expires_at']}. Cannot issue request for {endpoint}."
-                )
-            self.active_lease = current_lease
+        # 1. Authoritative lease verification from remote/authoritative state
+        state = self.load_remote_state() if (self.require_remote or self.token) else self._load_local_state()
+        current_lease = state.get("lease")
+        if not current_lease or current_lease.get("owner") != self.runner_id:
+            self.active_lease = None
+            raise LeaseConflictError(
+                f"Runner {self.runner_id} lost or does not hold lease ownership "
+                f"(current: {current_lease.get('owner') if current_lease else 'None'}). "
+                f"Cannot issue upstream request for {endpoint}."
+            )
+        if now >= datetime.fromisoformat(current_lease["expires_at"]):
+            self.active_lease = None
+            raise LeaseConflictError(
+                f"Runner {self.runner_id} lease expired at {current_lease['expires_at']}. "
+                f"Cannot issue request for {endpoint}."
+            )
+        self.active_lease = current_lease
+
+        # 2. Check 24h budget against active history
+        active = [r for r in state.get("history", []) if r.get("timestamp", "") >= cutoff]
+        if len(active) >= self.daily_limit:
+            raise BudgetExceededError(
+                f"Rolling 24h upstream budget limit ({self.daily_limit}) reached ({len(active)} used)! "
+                f"Pre-reservation rejected for {endpoint}."
+            )
+
+        # 3. Append reservation and commit before network socket call
+        entry = {
+            "timestamp": now.isoformat(),
+            "endpoint": endpoint,
+            "runner_id": self.runner_id,
+            "status": "RESERVED",
+        }
+        active.append(entry)
+        state["history"] = active
+        state["snapshot_hashes"] = self.snapshot_hashes
 
         if self.require_remote or self.token:
-            # Load remote state to inspect current budget
-            state = self.load_remote_state()
-            active = [r for r in state.get("history", []) if r.get("timestamp", "") >= cutoff]
-
-            if len(active) >= self.daily_limit:
-                raise BudgetExceededError(
-                    f"Rolling 24h upstream budget limit ({self.daily_limit}) reached! Pre-reservation rejected for {endpoint}."
-                )
-
-            entry = {
-                "timestamp": now.isoformat(),
-                "endpoint": endpoint,
-                "runner_id": self.runner_id,
-                "status": "RESERVED",
-            }
-            active.append(entry)
-            state["history"] = active
-
-            # Commit remotely before returning to caller
             success = self.save_remote_state(state)
             if not success:
                 raise RemoteStateError(f"Failed to durably commit request quota reservation for {endpoint}.")
             self.history = active
             logger.debug("Quota reserved and committed remotely for %s (%d/%d used)", endpoint, len(active), self.daily_limit)
         else:
-            # Local development mode
-            state = self._load_local_state()
-            active = [r for r in state.get("history", []) if r.get("timestamp", "") >= cutoff]
-
-            if len(active) >= self.daily_limit:
-                raise BudgetExceededError(
-                    f"Rolling 24h upstream budget limit ({self.daily_limit}) reached! Pre-reservation rejected for {endpoint}."
-                )
-
-            entry = {
-                "timestamp": now.isoformat(),
-                "endpoint": endpoint,
-                "runner_id": self.runner_id,
-                "status": "RESERVED",
-            }
-            active.append(entry)
-            state["history"] = active
             self._save_local_state(state)
             self.history = active
 

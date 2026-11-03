@@ -15,25 +15,24 @@ export async function verifyCloudflareAccess(
   req: Request,
   config: AuthConfig
 ): Promise<{ valid: boolean; reason?: string }> {
-  // If Access credentials configured, require them strictly
-  if (config.accessClientId && config.accessClientSecret) {
-    const clientId = req.headers.get('CF-Access-Client-Id') || req.headers.get('X-Cloudflare-Client-Id');
-    const clientSecret = req.headers.get('CF-Access-Client-Secret') || req.headers.get('X-Cloudflare-Client-Secret');
-
-    if (!clientId || !clientSecret) {
-      return { valid: false, reason: 'Missing Cloudflare Access service token headers' };
-    }
-    if (clientId !== config.accessClientId || clientSecret !== config.accessClientSecret) {
-      return { valid: false, reason: 'Invalid Cloudflare Access service token' };
+  // Fail closed by default: requires valid Access configuration unless explicitly disabled in dev
+  const requireAccess = config.requireAccess !== false;
+  if (!config.accessClientId || !config.accessClientSecret) {
+    if (requireAccess) {
+      return { valid: false, reason: 'Cloudflare Access protection required but not configured on server (fail closed)' };
     }
     return { valid: true };
   }
 
-  // Fail closed if Access protection is required but not configured
-  if (config.requireAccess) {
-    return { valid: false, reason: 'Cloudflare Access protection required but not configured on server (fail closed)' };
-  }
+  const clientId = req.headers.get('CF-Access-Client-Id') || req.headers.get('X-Cloudflare-Client-Id');
+  const clientSecret = req.headers.get('CF-Access-Client-Secret') || req.headers.get('X-Cloudflare-Client-Secret');
 
+  if (!clientId || !clientSecret) {
+    return { valid: false, reason: 'Missing Cloudflare Access service token headers' };
+  }
+  if (clientId !== config.accessClientId || clientSecret !== config.accessClientSecret) {
+    return { valid: false, reason: 'Invalid Cloudflare Access service token' };
+  }
   return { valid: true };
 }
 
@@ -104,41 +103,28 @@ export async function verifyAndRecordNonce(
     return { valid: false, reason: 'Invalid nonce format' };
   }
 
-  // 1. Authoritative ACID atomic lock via D1 PRIMARY KEY constraint
-  if (db) {
-    try {
-      // Direct atomic INSERT: SQLite PRIMARY KEY enforces atomicity without check-then-act race
-      await db
-        .prepare('INSERT INTO seen_nonces (nonce, timestamp_sec) VALUES (?, ?)')
-        .bind(nonce, timestampSec)
-        .run();
-
-      // Write-through to KV for edge caching if available
-      if (kv) {
-        await kv.put(`nonce:${nonce}`, timestampSec.toString(), { expirationTtl: 600 }).catch(() => {});
-      }
-      return { valid: true };
-    } catch (err: any) {
-      const errStr = String(err?.message || err);
-      if (errStr.includes('UNIQUE') || errStr.includes('PRIMARY KEY')) {
-        return { valid: false, reason: 'Nonce already used (replay attack detected)' };
-      }
-      return { valid: false, reason: `Nonce persistence check failed: ${errStr}` };
-    }
+  // Authoritative atomic lock via D1 PRIMARY KEY constraint (fails closed without D1)
+  if (!db) {
+    return { valid: false, reason: 'D1 Database binding required for authoritative atomic replay protection (fail closed)' };
   }
 
-  // 2. Fallback to KV only when D1 is unconfigured (e.g. KV-only staging)
-  if (kv) {
-    const key = `nonce:${nonce}`;
-    const existing = await kv.get(key);
-    if (existing) {
+  try {
+    // Direct atomic INSERT: SQLite PRIMARY KEY enforces atomicity without check-then-act race
+    await db
+      .prepare('INSERT INTO seen_nonces (nonce, timestamp_sec) VALUES (?, ?)')
+      .bind(nonce, timestampSec)
+      .run();
+
+    // Optional write-through to KV for edge caching
+    if (kv) {
+      await kv.put(`nonce:${nonce}`, timestampSec.toString(), { expirationTtl: 600 }).catch(() => {});
+    }
+    return { valid: true };
+  } catch (err: any) {
+    const errStr = String(err?.message || err);
+    if (errStr.includes('UNIQUE') || errStr.includes('PRIMARY KEY')) {
       return { valid: false, reason: 'Nonce already used (replay attack detected)' };
     }
-    // Store nonce with 10-minute TTL (600 seconds)
-    await kv.put(key, timestampSec.toString(), { expirationTtl: 600 });
-    return { valid: true };
+    return { valid: false, reason: `Nonce persistence check failed: ${errStr}` };
   }
-
-  // If neither KV nor D1 is present, fail closed
-  return { valid: false, reason: 'Persistence binding required for durable replay protection' };
 }
