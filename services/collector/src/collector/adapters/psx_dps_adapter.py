@@ -37,8 +37,8 @@ class PSXDPSAdapter(PSXSourceAdapter):
     ):
         super().__init__(source_name="psx-dps")
         self.budget_manager = budget_manager or RequestBudgetManager()
-        self.cooldown_manager = cooldown_manager or CooldownManager()
-        self.token_provider = token_provider or PSXTokenProvider()
+        self.cooldown_manager = cooldown_manager or CooldownManager(coordinator=self.budget_manager)
+        self.token_provider = token_provider or PSXTokenProvider(budget_recorder=self.budget_manager)
         self.min_interval_seconds = min_interval_seconds
         self.timeout_seconds = timeout_seconds
 

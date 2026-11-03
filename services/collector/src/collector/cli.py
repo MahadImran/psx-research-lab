@@ -71,6 +71,7 @@ def cmd_run(args):
         "ARCHIVE_COMMITTED_INGEST_PENDING",
         "MARKET_CLOSED",
         "SKIPPED_LEASE_CONFLICT",
+        "SOURCE_COOLDOWN",
         "SUCCESS",
         "SKIPPED",
     )

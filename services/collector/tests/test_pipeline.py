@@ -310,3 +310,63 @@ def test_durable_snapshot_deduplication_skips_duplicate_archive(tmp_path):
         res3 = pipeline.run(force=False, dry_run=False)
         assert any("snapshot" in f for f in res3["archivedFiles"])
         assert mock_coordinator.get_last_snapshot_hash("psx-dps", res3["tradingDate"]) == "2" * 64
+
+
+def test_pipeline_skips_on_source_cooldown():
+    pipeline = CollectorPipeline()
+    with patch("collector.calendar.MarketCalendar.should_scheduled_collector_run", return_value=(True, "Market active")):
+        with patch.object(pipeline.coordinator, "acquire_lease_and_sync"):
+            with patch.object(pipeline.coordinator, "is_in_cooldown", return_value=True):
+                with patch.object(pipeline.coordinator, "get_remaining_cooldown_seconds", return_value=95.5):
+                    pipeline.coordinator.cooldown_until = "2026-11-03T19:00:00Z"
+                    with patch.object(pipeline.healthchecks, "ping_skip") as mock_skip:
+                        res = pipeline.run(force=True)
+                        assert res["status"] == "SOURCE_COOLDOWN"
+                        assert "cooldown" in res["reason"]
+                        mock_skip.assert_called_once()
+
+
+def test_pipeline_handles_nodata_in_eod_reconciliation(tmp_path):
+    from collector.vendor.psx_dps.errors import NoData
+
+    archive_dir = str(tmp_path / "archive")
+    state_file = str(tmp_path / "state.json")
+
+    mock_coordinator = PersistentCoordinator(token=None, local_state_file=state_file, daily_limit=250, require_remote=False)
+    mock_archive = DurableArchiveManager(token=None, local_archive_dir=archive_dir, require_remote=False)
+    mock_hc = HealthchecksNotifier(ping_url="https://hc-ping.com/test-uuid")
+
+    mock_adapter = MagicMock()
+    mock_adapter.get_snapshot.return_value = UpstreamResponse(
+        source="psx-dps",
+        endpoint="snapshot",
+        data={"rows": [{"symbol": "OGDC", "current": 136.5, "change": 1.2, "percentChange": 0.88, "volume": 50000}]},
+        raw_sha256="a" * 64,
+        record_count=1,
+        duration_ms=45.0,
+        status_code=200,
+    )
+    mock_adapter.get_indices.return_value = UpstreamResponse(
+        source="psx-dps",
+        endpoint="indices",
+        data=[],
+        raw_sha256="b" * 64,
+        record_count=0,
+        duration_ms=10.0,
+        status_code=200,
+    )
+    # EOD raises NoData because market just closed and DPS date table is pending
+    mock_adapter.get_eod.side_effect = NoData("no rows (settlement pending)")
+
+    pipeline = CollectorPipeline(
+        adapter=mock_adapter,
+        coordinator=mock_coordinator,
+        archive_manager=mock_archive,
+        healthchecks=mock_hc,
+    )
+
+    with patch("collector.pipeline.MarketCalendar.get_market_session", return_value=("CLOSED", True)):
+        res = pipeline.run(force=True, force_eod=True, dry_run=False)
+        # Should gracefully finish and commit the snapshot manifest rather than crashing
+        assert res["status"] in ("FULLY_SUCCESSFUL_CYCLE", "ARCHIVE_COMMITTED_INGEST_PENDING")
+        assert any("snapshot" in f for f in res["archivedFiles"])

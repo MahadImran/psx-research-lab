@@ -1,24 +1,25 @@
 {
-  "timestamp_utc": "2026-11-02T00:44:23.605581+00:00",
+  "timestamp_utc": "2026-11-03T18:40:51.384054+00:00",
   "mode": "live",
   "adapter": "psx-dps",
-  "requests_executed": 3,
+  "requests_executed": 6,
   "calls": [
     {
       "id": "symbols",
       "description": "Symbol Directory",
       "status": "SUCCESS",
-      "sha256": "5a44bb7f21f5170221061d112fd66427dcb2c64c236f35d36890a2e716710831",
-      "record_count": 559,
-      "duration_ms": 3365.68,
+      "sha256": "f2acc45bf8306272c7360fe153685d8caa06c2e043e328ea98b15dbe10d75d17",
+      "record_count": 771,
+      "duration_ms": 3.28,
       "field_coverage": {
-        "type": "list_of_dicts (count=559)",
+        "type": "list_of_dicts (count=771)",
         "fields": {
           "symbol": "str",
           "name": "str",
           "sectorName": "str",
           "isETF": "bool",
-          "isDebt": "bool"
+          "isDebt": "bool",
+          "isGEM": "bool"
         }
       },
       "error": null
@@ -27,16 +28,15 @@
       "id": "snapshot",
       "description": "Whole-Market Snapshot",
       "status": "SUCCESS",
-      "sha256": "5c5bb5a3ab97f01423ddf4e1dde6b6f023c6563c63b653ad2ea26a8ef9f554d5",
-      "record_count": 559,
-      "duration_ms": 3963.18,
+      "sha256": "8ca57d8c070991dde52b3447d788b5463918e8950b5ce734507a1267a633f758",
+      "record_count": 500,
+      "duration_ms": 56.22,
       "field_coverage": {
         "type": "dict",
         "fields": {
-          "source": "str",
           "captured_at": "str",
           "session": "str",
-          "rows": "list(count=559) with keys ['symbol', 'current', 'change', 'volume', 'name']"
+          "rows": "list(count=500) with keys ['symbol', 'sector', 'listed', 'ldcp', 'open']"
         }
       },
       "error": null
@@ -44,30 +44,46 @@
     {
       "id": "eod_ogdc",
       "description": "EOD Daily Bars: OGDC",
-      "status": "ERROR",
-      "sha256": null,
-      "record_count": 0,
-      "duration_ms": 0.0,
-      "field_coverage": null,
-      "error": "/timeseries/eod/OGDC: HTTP 404"
+      "status": "SUCCESS",
+      "sha256": "f39cff46d7b20737053a7a67ed14c4bfb4b95e16259b114298677b10a54661e1",
+      "record_count": 1240,
+      "duration_ms": 5.58,
+      "field_coverage": {
+        "type": "list_of_dicts (count=1240)",
+        "fields": {
+          "date": "str",
+          "open": "float",
+          "close": "float",
+          "volume": "int"
+        }
+      },
+      "error": null
     },
     {
       "id": "eod_engro",
       "description": "EOD Daily Bars: ENGRO",
-      "status": "ERROR",
-      "sha256": null,
-      "record_count": 0,
-      "duration_ms": 0.0,
-      "field_coverage": null,
-      "error": "/timeseries/eod/ENGRO: HTTP 404"
+      "status": "SUCCESS",
+      "sha256": "de6dfcee23b449f103ff33f1931f2c190e8a86fe913e14d7dd95c42bff27bb6f",
+      "record_count": 1223,
+      "duration_ms": 6.06,
+      "field_coverage": {
+        "type": "list_of_dicts (count=1223)",
+        "fields": {
+          "date": "str",
+          "open": "int",
+          "close": "float",
+          "volume": "int"
+        }
+      },
+      "error": null
     },
     {
       "id": "indices",
       "description": "Current Market Indices",
       "status": "SUCCESS",
-      "sha256": "249fcfc29ec1024162c944e8c70d30866139bb2361be1c72cf6ca7fe38f40b6d",
+      "sha256": "90cce83ab780b82f6cf1bdedcc2654c66111e9c4308d7ac546a519d83605fb54",
       "record_count": 18,
-      "duration_ms": 5.92,
+      "duration_ms": 9.52,
       "field_coverage": {
         "type": "list_of_dicts (count=18)",
         "fields": {
@@ -84,14 +100,21 @@
     {
       "id": "intraday_ogdc",
       "description": "Intraday Ticks: OGDC",
-      "status": "ERROR",
-      "sha256": null,
-      "record_count": 0,
-      "duration_ms": 0.0,
-      "field_coverage": null,
-      "error": "/timeseries/int/OGDC: HTTP 404"
+      "status": "SUCCESS",
+      "sha256": "4adf4dc82a8d5edb0c3ad15d2d34d0c63c8311a40c9a83dca1c7d1fc946a78c1",
+      "record_count": 1891,
+      "duration_ms": 5.61,
+      "field_coverage": {
+        "type": "list_of_dicts (count=1891)",
+        "fields": {
+          "time": "datetime",
+          "price": "int",
+          "volume": "int"
+        }
+      },
+      "error": null
     }
   ],
-  "budget_used_24h": 26,
-  "budget_remaining_24h": 224
+  "budget_used_24h": 64,
+  "budget_remaining_24h": 186
 }

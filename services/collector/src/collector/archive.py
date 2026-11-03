@@ -262,6 +262,17 @@ class DurableArchiveManager:
                         f.write(existing_bytes)
                 except Exception as backup_err:
                     logger.error("Failed to write local backup of corrupted manifest: %s", backup_err)
+
+                if self.token or self.require_remote:
+                    try:
+                        self.commit_file_to_archive(
+                            rel_path=corrupt_backup,
+                            content_bytes=existing_bytes,
+                            commit_message=f"alert(manifest): preserve corrupted manifest for {trading_date}",
+                        )
+                    except Exception as remote_backup_err:
+                        logger.error("Failed to write remote backup of corrupted manifest: %s", remote_backup_err)
+
                 raise ArchiveCommitError(
                     f"Corrupt or unreadable existing manifest at {rel_path}: {e}. "
                     f"Commit aborted to protect historical records from being discarded."

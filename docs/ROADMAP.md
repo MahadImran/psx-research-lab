@@ -42,7 +42,9 @@
 ### GATEWAY: FOUNDATION LOCKDOWN DIRECTIVE
 > [!IMPORTANT]
 > **MILESTONE 3 IS CURRENTLY NOT AUTHORIZED.**
-> Milestones M0, M1, and M2 have undergone complete engineering lockdown, code refactoring, adversarial testing, and live verification. No M3 code, Cloudflare infrastructure deployment, or unattended cron scheduling may begin without explicit written authorization from the owner.
+> Milestones M0, M1, and M2 have undergone complete engineering lockdown, code refactoring, adversarial testing, and live verification.
+> For the authoritative evidence, test results, defect log, and readiness assessment, consult the consolidated **[Foundation Acceptance Package](file:///Users/mahadimran/work/PSX_RESEARCH_LAB/docs/FOUNDATION_ACCEPTANCE_PACKAGE.md)**.
+> No M3 code, Cloudflare infrastructure deployment, or unattended cron scheduling may begin without explicit written authorization from the owner.
 
 ---
 

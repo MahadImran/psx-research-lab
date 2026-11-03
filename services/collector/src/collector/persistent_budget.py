@@ -16,6 +16,8 @@ import urllib.error
 import base64
 from typing import Any, Dict, List, Optional, Tuple
 
+from .cooldown import CircuitBreakerTrippedError
+
 logger = logging.getLogger(__name__)
 
 
@@ -416,14 +418,69 @@ class PersistentCoordinator:
         active = [r for r in self.history if r.get("timestamp", "") >= cutoff]
         return max(0, self.daily_limit - len(active))
 
+    def is_in_cooldown(self) -> bool:
+        """Checks if remote or local state records an active circuit breaker cooldown."""
+        if not self.cooldown_until:
+            try:
+                state = self.load_remote_state() if (self.require_remote or self.token) else self._load_local_state()
+                self.cooldown_until = state.get("cooldown_until")
+            except Exception:
+                pass
+        if not self.cooldown_until:
+            return False
+        try:
+            now = datetime.now(timezone.utc)
+            return now < datetime.fromisoformat(self.cooldown_until)
+        except Exception:
+            return False
+
+    def get_remaining_cooldown_seconds(self) -> float:
+        """Returns seconds remaining in active cooldown, or 0.0 if expired."""
+        if not self.is_in_cooldown() or not self.cooldown_until:
+            return 0.0
+        try:
+            now = datetime.now(timezone.utc)
+            return max(0.0, (datetime.fromisoformat(self.cooldown_until) - now).total_seconds())
+        except Exception:
+            return 0.0
+
+    def record_cooldown(self, cooldown_seconds: int, reason: Optional[str] = None) -> None:
+        """Persists cross-runner cooldown in remote state."""
+        now = datetime.now(timezone.utc)
+        cooldown_dt = now + timedelta(seconds=max(1, cooldown_seconds))
+        self.cooldown_until = cooldown_dt.isoformat()
+        logger.warning(
+            "Upstream source entered cooldown until %s (duration %ds, reason: %s)",
+            self.cooldown_until,
+            cooldown_seconds,
+            reason,
+        )
+        state = self.load_remote_state() if (self.require_remote or self.token) else self._load_local_state()
+        state["cooldown_until"] = self.cooldown_until
+        state["history"] = self.history
+        state["lease"] = self.active_lease
+        state["snapshot_hashes"] = self.snapshot_hashes
+        if self.require_remote or self.token:
+            self.save_remote_state(state)
+        else:
+            self._save_local_state(state)
+
     def reserve_request(self, endpoint: str) -> None:
         """
         Durably reserves an upstream request quota BEFORE the network socket request is made.
         Fails closed: if remote persistence cannot be committed, raises RemoteStateError or
-        BudgetExceededError or LeaseConflictError, and the upstream request must NOT proceed.
+        BudgetExceededError or LeaseConflictError or CircuitBreakerTrippedError, and the upstream request must NOT proceed.
         """
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(hours=24)).isoformat()
+
+        # 0. Check circuit breaker cooldown
+        if self.is_in_cooldown():
+            rem = self.get_remaining_cooldown_seconds()
+            raise CircuitBreakerTrippedError(
+                f"Source circuit breaker is active in persistent state! Cooldown remaining: {rem:.1f}s until {self.cooldown_until}. "
+                f"Cannot issue upstream request for {endpoint}."
+            )
 
         # 1. Authoritative lease verification from remote/authoritative state
         state = self.load_remote_state() if (self.require_remote or self.token) else self._load_local_state()
@@ -485,5 +542,6 @@ class PersistentCoordinator:
             "history": self.history,
             "lease": self.active_lease,
             "cooldown_until": self.cooldown_until,
+            "snapshot_hashes": self.snapshot_hashes,
         }
         self.save_remote_state(state)

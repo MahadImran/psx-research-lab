@@ -28,6 +28,7 @@ from .persistent_budget import (
 from .quarantine import QuarantineAuditor
 from .reconciliation import EODReconciler
 from .session_token import PSXTokenProvider
+from .vendor.psx_dps.errors import NoData
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,19 @@ class CollectorPipeline:
             logger.error("Remote coordination state failed: %s", e)
             self.healthchecks.ping_fail(f"Remote state error: {e}")
             raise
+
+        # Check circuit breaker cooldown before attempting requests
+        if self.coordinator.is_in_cooldown():
+            rem = self.coordinator.get_remaining_cooldown_seconds()
+            reason = f"Upstream source is in cooldown ({rem:.1f}s remaining until {self.coordinator.cooldown_until})"
+            logger.warning(reason)
+            self.healthchecks.ping_skip(reason)
+            return {
+                "runId": run_id,
+                "status": "SOURCE_COOLDOWN",
+                "reason": reason,
+                "tradingDate": trading_date,
+            }
 
         try:
             remaining_budget = self.coordinator.get_remaining_requests()
@@ -298,6 +312,8 @@ class CollectorPipeline:
                             commit_message=f"data(eod): {trading_date} official settlement",
                         )
                         archived_files.append(rel_path)
+                except NoData as e:
+                    logger.warning("EOD settlement table not yet published by PSX DPS for %s: %s", trading_date, e)
                 except Exception as e:
                     logger.error("EOD reconciliation failed: %s", e)
                     self.healthchecks.ping_fail(f"EOD reconciliation error: {e}")

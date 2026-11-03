@@ -115,6 +115,14 @@ export async function verifyAndRecordNonce(
       .bind(nonce, timestampSec)
       .run();
 
+    // Opportunistically prune nonces older than 1 hour (3600s) to keep D1 storage lean under 500MB free tier
+    const purgeCutoff = timestampSec - 3600;
+    await db
+      .prepare('DELETE FROM seen_nonces WHERE timestamp_sec < ?')
+      .bind(purgeCutoff)
+      .run()
+      .catch(() => {});
+
     // Optional write-through to KV for edge caching
     if (kv) {
       await kv.put(`nonce:${nonce}`, timestampSec.toString(), { expirationTtl: 600 }).catch(() => {});

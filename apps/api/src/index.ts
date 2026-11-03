@@ -182,13 +182,23 @@ app.get('/v1/market/latest', async (c) => {
     return c.json({ status: 'NO_VERIFIED_DATA', message: 'No market snapshot has been ingested.' }, 404);
   }
 
-  return c.json({
+  const response: Record<string, any> = {
     batchId: snapshot.batch_id,
     tradingDate: snapshot.trading_date,
     source: snapshot.source,
     symbolsCount: snapshot.symbols_count,
     fetchedAtUtc: snapshot.fetched_at_utc,
-  });
+  };
+
+  if (c.req.query('observations') === 'true') {
+    const obs = await c.env.DB
+      .prepare('SELECT symbol, current_price as currentPrice, change_value as changeValue, change_percent as changePercent, volume, high, low FROM snapshot_observations WHERE batch_id = ?')
+      .bind(snapshot.batch_id)
+      .all();
+    response.observations = obs.results || [];
+  }
+
+  return c.json(response);
 });
 
 app.get('/v1/stocks/:ticker/history', async (c) => {
@@ -197,9 +207,26 @@ app.get('/v1/stocks/:ticker/history', async (c) => {
     return c.json({ symbol: ticker, coverage: 'NONE', barsCount: 0, bars: [] }, 404);
   }
 
+  const fromDate = c.req.query('from');
+  const toDate = c.req.query('to');
+
+  let query = 'SELECT trading_date, open, high, low, close, volume, revision FROM daily_bars WHERE symbol = ? AND is_active = 1';
+  const params: any[] = [ticker];
+
+  if (fromDate) {
+    query += ' AND trading_date >= ?';
+    params.push(fromDate);
+  }
+  if (toDate) {
+    query += ' AND trading_date <= ?';
+    params.push(toDate);
+  }
+
+  query += ' ORDER BY trading_date ASC';
+
   const bars = await c.env.DB
-    .prepare('SELECT trading_date, open, high, low, close, volume, revision FROM daily_bars WHERE symbol = ? AND is_active = 1 ORDER BY trading_date ASC')
-    .bind(ticker)
+    .prepare(query)
+    .bind(...params)
     .all();
 
   return c.json({
@@ -338,7 +365,7 @@ app.post('/v1/admin/ingest', async (c) => {
           bar.isQuarantined ? 1 : 0,
           bar.quarantineReason || null,
           bar.dataGrade || 'GRADE_B',
-          bar.hash,
+          manifest.payloadSha256,
           bar.fetchedAtUtc
         )
       );

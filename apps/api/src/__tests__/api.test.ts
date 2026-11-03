@@ -30,8 +30,12 @@ function createMockKV(): KVNamespace {
 }
 
 function createMockDB(): D1Database {
-  const nonces = new Set<string>();
+  const nonces = new Map<string, number>();
   const ingestions: any[] = [];
+  const bars: any[] = [];
+  const snapshots: any[] = [];
+  const observations: any[] = [];
+
   return {
     prepare: (query: string) => {
       let boundParams: any[] = [];
@@ -48,24 +52,119 @@ function createMockDB(): D1Database {
           if (query.includes('raw_ingestions')) {
             return (ingestions.length > 0 ? ingestions[ingestions.length - 1] : null) as T;
           }
+          if (query.includes('snapshots')) {
+            const active = snapshots.filter((s) => s.is_active === 1);
+            return (active.length > 0 ? active[active.length - 1] : null) as T;
+          }
           return null as T;
         },
-        all: async () => ({ results: [] }),
+        all: async () => {
+          if (query.includes('daily_bars')) {
+            const symbol = boundParams[0];
+            let activeBars = bars.filter((b) => b.symbol === symbol && b.is_active === 1);
+            let paramIdx = 1;
+            if (query.includes('trading_date >=')) {
+              const fromVal = boundParams[paramIdx++];
+              activeBars = activeBars.filter((b) => b.trading_date >= fromVal);
+            }
+            if (query.includes('trading_date <=')) {
+              const toVal = boundParams[paramIdx++];
+              activeBars = activeBars.filter((b) => b.trading_date <= toVal);
+            }
+            return { results: activeBars };
+          }
+          if (query.includes('snapshot_observations')) {
+            const batchId = boundParams[0];
+            const obs = observations.filter((o) => o.batch_id === batchId);
+            return { results: obs };
+          }
+          if (query.includes('symbols')) {
+            return { results: [] };
+          }
+          return { results: [] };
+        },
         run: async () => {
-          if (query.includes('seen_nonces')) {
+          if (query.includes('INSERT INTO seen_nonces')) {
             const n = boundParams[0];
+            const ts = boundParams[1];
             if (nonces.has(n)) {
               throw new Error('UNIQUE constraint failed: seen_nonces.nonce');
             }
-            nonces.add(n);
-          }
-          if (query.includes('raw_ingestions')) {
-            ingestions.push({
-              ingestion_id: boundParams[0],
-              source: boundParams[1],
-              trading_date: boundParams[2],
-              fetched_at_utc: boundParams[7],
-              status: 'ACCEPTED',
+            nonces.set(n, ts);
+          } else if (query.includes('DELETE FROM seen_nonces')) {
+            const cutoff = boundParams[0];
+            for (const [k, v] of nonces.entries()) {
+              if (v < cutoff) nonces.delete(k);
+            }
+          } else if (query.includes('raw_ingestions')) {
+            if (query.includes("UPDATE raw_ingestions SET status = 'ACCEPTED'")) {
+              const id = boundParams[0];
+              const ing = ingestions.find((i) => i.ingestion_id === id);
+              if (ing) ing.status = 'ACCEPTED';
+            } else {
+              ingestions.push({
+                ingestion_id: boundParams[0],
+                source: boundParams[1],
+                trading_date: boundParams[2],
+                sha256: boundParams[3],
+                records_count: boundParams[5],
+                fetched_at_utc: boundParams[6] || boundParams[7] || new Date().toISOString(),
+                status: 'STAGED',
+              });
+            }
+          } else if (query.includes('daily_bars')) {
+            if (query.includes('UPDATE daily_bars SET is_active = 1')) {
+              const payloadSha256 = boundParams[0];
+              for (const b of bars) {
+                if (b.payload_sha256 === payloadSha256) {
+                  b.is_active = 1;
+                }
+              }
+            } else if (query.includes('INSERT OR REPLACE INTO daily_bars')) {
+              bars.push({
+                source: boundParams[0],
+                symbol: boundParams[1],
+                trading_date: boundParams[2],
+                revision: boundParams[3],
+                open: boundParams[4],
+                high: boundParams[5],
+                low: boundParams[6],
+                close: boundParams[7],
+                volume: boundParams[8],
+                payload_sha256: boundParams[12],
+                fetched_at_utc: boundParams[13],
+                is_active: 0,
+              });
+            }
+          } else if (query.includes('snapshots')) {
+            if (query.includes('UPDATE snapshots SET is_active = 1')) {
+              const batchId = boundParams[0];
+              for (const s of snapshots) {
+                if (s.batch_id === batchId) {
+                  s.is_active = 1;
+                }
+              }
+            } else if (query.includes('INSERT OR REPLACE INTO snapshots')) {
+              snapshots.push({
+                batch_id: boundParams[0],
+                source: boundParams[1],
+                trading_date: boundParams[2],
+                raw_sha256: boundParams[3],
+                symbols_count: boundParams[4],
+                fetched_at_utc: boundParams[5],
+                is_active: 0,
+              });
+            }
+          } else if (query.includes('snapshot_observations')) {
+            observations.push({
+              batch_id: boundParams[0],
+              symbol: boundParams[1],
+              current_price: boundParams[2],
+              change_value: boundParams[3],
+              change_percent: boundParams[4],
+              volume: boundParams[5],
+              high: boundParams[6],
+              low: boundParams[7],
             });
           }
           return { success: true };
@@ -416,5 +515,212 @@ describe('API Routes & Security', () => {
     expect(resIdempotent.status).toBe(200);
     const idempotentData = (await resIdempotent.json()) as any;
     expect(idempotentData.message).toContain('idempotent');
+  });
+
+  it('GET /v1/stocks/:ticker/history activates bars via manifest.payloadSha256 and supports from/to filtering', async () => {
+    const mockDb = createMockDB();
+    const mockEnv = {
+      ...baseMockEnv,
+      DB: mockDb,
+      KV: createMockKV(),
+    };
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = 'history-test-nonce-1';
+    const payloadSha256 = 'd'.repeat(64);
+
+    // Ingest 2 bars for OGDC on different dates where bar.hash != payloadSha256
+    const payload = {
+      manifest: {
+        manifestVersion: '1.0.0',
+        generatedAtUtc: new Date().toISOString(),
+        tradingDate: '2026-10-31',
+        source: 'psx-dps',
+        totalBars: 2,
+        totalSnapshots: 0,
+        totalIndices: 0,
+        payloadSha256,
+      },
+      bars: [
+        {
+          source: 'psx-dps',
+          symbol: 'OGDC',
+          tradingDate: '2026-10-30',
+          revision: 0,
+          open: 150.0,
+          high: 155.0,
+          low: 149.0,
+          close: 153.0,
+          volume: 1000000,
+          isQuarantined: false,
+          dataGrade: 'GRADE_A',
+          hash: 'e'.repeat(64), // deliberately different from payloadSha256
+          fetchedAtUtc: new Date().toISOString(),
+        },
+        {
+          source: 'psx-dps',
+          symbol: 'OGDC',
+          tradingDate: '2026-10-31',
+          revision: 0,
+          open: 153.0,
+          high: 157.0,
+          low: 152.0,
+          close: 156.0,
+          volume: 1200000,
+          isQuarantined: false,
+          dataGrade: 'GRADE_A',
+          hash: 'f'.repeat(64), // deliberately different from payloadSha256
+          fetchedAtUtc: new Date().toISOString(),
+        },
+      ],
+      indices: [],
+      collectorRunId: 'run-history-ogdc',
+      timestamp,
+      nonce,
+    };
+
+    const body = JSON.stringify(payload);
+    const message = `${timestamp}.${nonce}.${body}`;
+    const sig = await computeHmac(message, TEST_SECRET);
+
+    const ingestRes = await app.request(
+      '/v1/admin/ingest',
+      {
+        method: 'POST',
+        headers: {
+          ...defaultAccessHeaders,
+          'X-Ingest-Signature': sig,
+          'X-Ingest-Timestamp': timestamp.toString(),
+          'X-Ingest-Nonce': nonce,
+        },
+        body,
+      },
+      mockEnv
+    );
+    expect(ingestRes.status).toBe(200);
+
+    // 1. Query full history: all active bars returned
+    const allRes = await app.request('/v1/stocks/OGDC/history', {}, mockEnv);
+    expect(allRes.status).toBe(200);
+    const allData = (await allRes.json()) as any;
+    expect(allData.symbol).toBe('OGDC');
+    expect(allData.barsCount).toBe(2);
+
+    // 2. Query with from filter
+    const fromRes = await app.request('/v1/stocks/OGDC/history?from=2026-10-31', {}, mockEnv);
+    expect(fromRes.status).toBe(200);
+    const fromData = (await fromRes.json()) as any;
+    expect(fromData.barsCount).toBe(1);
+    expect(fromData.bars[0].trading_date).toBe('2026-10-31');
+
+    // 3. Query with to filter
+    const toRes = await app.request('/v1/stocks/OGDC/history?to=2026-10-30', {}, mockEnv);
+    expect(toRes.status).toBe(200);
+    const toData = (await toRes.json()) as any;
+    expect(toData.barsCount).toBe(1);
+    expect(toData.bars[0].trading_date).toBe('2026-10-30');
+
+    // 4. Query out-of-range date
+    const emptyRes = await app.request('/v1/stocks/OGDC/history?from=2026-11-05', {}, mockEnv);
+    expect(emptyRes.status).toBe(200);
+    const emptyData = (await emptyRes.json()) as any;
+    expect(emptyData.barsCount).toBe(0);
+  });
+
+  it('GET /v1/market/latest returns snapshot and observations with ?observations=true', async () => {
+    const mockDb = createMockDB();
+    const mockEnv = {
+      ...baseMockEnv,
+      DB: mockDb,
+      KV: createMockKV(),
+    };
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = 'snapshot-obs-nonce-1';
+    const payloadSha256 = 'a'.repeat(64);
+
+    const batchId = '123e4567-e89b-12d3-a456-426614174000';
+    const payload = {
+      manifest: {
+        manifestVersion: '1.0.0',
+        generatedAtUtc: new Date().toISOString(),
+        tradingDate: '2026-10-31',
+        source: 'psx-dps',
+        totalBars: 0,
+        totalSnapshots: 2,
+        totalIndices: 0,
+        payloadSha256,
+      },
+      bars: [],
+      snapshot: {
+        batchId,
+        tradingDate: '2026-10-31',
+        source: 'psx-dps',
+        rawSha256: payloadSha256,
+        totalSymbols: 2,
+        fetchedAtUtc: new Date().toISOString(),
+        observations: [
+          {
+            symbol: 'OGDC',
+            current: 155.0,
+            change: 2.5,
+            changePercent: 1.64,
+            volume: 850000,
+            high: 156.0,
+            low: 152.0,
+          },
+          {
+            symbol: 'ENGRO',
+            current: 320.0,
+            change: -1.2,
+            changePercent: -0.37,
+            volume: 420000,
+            high: 323.0,
+            low: 318.0,
+          },
+        ],
+      },
+      indices: [],
+      collectorRunId: 'run-snapshot-test',
+      timestamp,
+      nonce,
+    };
+
+    const body = JSON.stringify(payload);
+    const message = `${timestamp}.${nonce}.${body}`;
+    const sig = await computeHmac(message, TEST_SECRET);
+
+    const ingestRes = await app.request(
+      '/v1/admin/ingest',
+      {
+        method: 'POST',
+        headers: {
+          ...defaultAccessHeaders,
+          'X-Ingest-Signature': sig,
+          'X-Ingest-Timestamp': timestamp.toString(),
+          'X-Ingest-Nonce': nonce,
+        },
+        body,
+      },
+      mockEnv
+    );
+    expect(ingestRes.status).toBe(200);
+
+    // Query latest without observations
+    const latestRes = await app.request('/v1/market/latest', {}, mockEnv);
+    expect(latestRes.status).toBe(200);
+    const latestData = (await latestRes.json()) as any;
+    expect(latestData.batchId).toBe(batchId);
+    expect(latestData.symbolsCount).toBe(2);
+    expect(latestData.observations).toBeUndefined();
+
+    // Query latest with ?observations=true
+    const latestWithObsRes = await app.request('/v1/market/latest?observations=true', {}, mockEnv);
+    expect(latestWithObsRes.status).toBe(200);
+    const latestWithObsData = (await latestWithObsRes.json()) as any;
+    expect(latestWithObsData.batchId).toBe(batchId);
+    expect(latestWithObsData.observations).toBeDefined();
+    expect(latestWithObsData.observations.length).toBe(2);
+    expect(latestWithObsData.observations[0].symbol).toBe('OGDC');
   });
 });

@@ -255,3 +255,18 @@ def test_corrupt_manifest_fails_closed_and_preserves_backup(tmp_path):
     corrupted_backups = [f for f in files if f.startswith(f"corrupted_{trading_date}")]
     assert len(corrupted_backups) >= 1
 
+
+def test_corrupt_manifest_attempts_remote_backup_when_token_available():
+    mgr = DurableArchiveManager(token="test-token", repo_name="test/repo", require_remote=True)
+    trading_date = "2026-11-02"
+    corrupt_bytes = b'{"corrupt": invalid_json'
+
+    with patch.object(mgr, "read_remote_file", return_value=(corrupt_bytes, "sha123")):
+        with patch.object(mgr, "commit_file_to_archive") as mock_commit:
+            with pytest.raises(ArchiveCommitError):
+                mgr.commit_daily_manifest(trading_date, {"verifiedArchiveFiles": []})
+            mock_commit.assert_called_once()
+            call_kwargs = mock_commit.call_args[1]
+            assert "corrupted_2026-11-02" in call_kwargs["rel_path"]
+            assert call_kwargs["content_bytes"] == corrupt_bytes
+

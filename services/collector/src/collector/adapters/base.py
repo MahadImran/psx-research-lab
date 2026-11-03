@@ -34,7 +34,7 @@ class PSXSourceAdapter(ABC):
         """Compute SHA-256 hash of data representation."""
         if isinstance(data, (bytes, bytearray)):
             return hashlib.sha256(data).hexdigest()
-        serialized = json.dumps(data, sort_keys=True).encode("utf-8")
+        serialized = json.dumps(data, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha256(serialized).hexdigest()
 
     @abstractmethod
