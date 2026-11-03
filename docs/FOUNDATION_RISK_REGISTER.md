@@ -1,7 +1,7 @@
 # PSX Research Lab — Foundation Risk Register
 
 **Status:** ACTIVE & MONITORED  
-**Last Updated:** 2026-11-02  
+**Last Updated:** 2026-11-03  
 **Scope:** Milestones 0, 1, and 2 Foundation Architecture, Security, Data Integrity, and Cost Controls  
 
 ---
@@ -18,6 +18,11 @@
 | **FR-06** | Reliability | HIGH | MEDIUM | **RESOLVED** | False-positive success reporting when cloud ingestion fails |
 | **FR-07** | Reliability | MEDIUM | MEDIUM | **RESOLVED** | GitHub REST API edge replication lag causing false readback failures |
 | **FR-08** | Data Quality | LOW | MEDIUM | **RESOLVED** | Nullable High/Low in PSX DPS index summary tables |
+| **FR-11** | Data Durability | HIGH | HIGH | **RESOLVED** | Raw archive object overwrite violating strict immutability |
+| **FR-12** | Security | HIGH | MEDIUM | **RESOLVED** | Cloudflare Access authorization bypass when unconfigured |
+| **FR-13** | Security & Concurrency | HIGH | MEDIUM | **RESOLVED** | KV-only fallback in HMAC nonce verification race conditions |
+| **FR-14** | Data Integrity | HIGH | MEDIUM | **RESOLVED** | Multi-batch D1 staging leaving unverified partial data queryable |
+| **FR-15** | Performance & Quota | MEDIUM | HIGH | **RESOLVED** | Redundant archive writes of unchanged intraday market snapshots |
 | **FR-09** | External | HIGH | LOW | **MONITORED** | Upstream PSX DPS endpoint breaking changes or anti-scraping blocks |
 | **FR-10** | Cost & Quota | LOW | LOW | **MONITORED** | GitHub Actions 2,000 free runner minutes exhaustion |
 
@@ -87,6 +92,44 @@
 - **Verification Proof:**
   - Unit Tests: `test_quarantine_accepts_valid_bar_with_nullable_high_low` in `test_quarantine.py`.
   - Schema Contract: `packages/shared/src/schemas/market.ts`.
+
+### FR-11: Raw Archive Object Overwrite Violating Strict Immutability
+- **Severity:** HIGH  
+- **Vulnerability:** `DurableArchiveManager._commit_file()` previously allowed updating an existing path if the remote SHA was retrieved, risking accidental or malicious overwrite of historical raw response payloads.
+- **Remediation:** Enforced strict raw object immutability in `archive.py`. For any path under `raw/`, if the file exists with differing content, the commit raises `ArchiveCommitError` ("Immutability violation... raw archive objects are strictly immutable"). Idempotent re-commits with identical content are recognized as clean no-ops.
+- **Verification Proof:**
+  - Unit Test: `test_archive_manager_immutability_violation_raises` in `test_archive.py`.
+  - Live GitHub Runner Verification: Run `41687650867` Step 8 rejected a tampered content overwrite attempt and Step 9 confirmed clean idempotency.
+
+### FR-12: Cloudflare Access Authorization Bypass When Unconfigured
+- **Severity:** HIGH  
+- **Vulnerability:** `verifyCloudflareAccess` middleware defaulted to `requireAccess = false` if omitted in handler invocations, potentially allowing unauthenticated public requests to hit edge ingestion endpoints when Access credentials were missing.
+- **Remediation:** Refactored `verifyCloudflareAccess` in `apps/api/src/middleware/auth.ts` to fail closed by default (`requireAccess !== false`). Missing Access environment variables or missing `CF-Access-Authenticated-User-Email` headers immediately return HTTP 403. Gated `/v1/admin/ingest` with `requireAccess: true`.
+- **Verification Proof:**
+  - Vitest Unit Tests: `apps/api/src/__tests__/api.test.ts` (`should reject 403 when access is required but credentials are missing in worker env`, `should reject 403 when CF-Access-Authenticated-User-Email header is missing`).
+
+### FR-13: KV-Only Fallback in HMAC Nonce Verification Race Conditions
+- **Severity:** HIGH  
+- **Vulnerability:** `verifyAndRecordNonce` allowed falling back to KV-only nonce storage when D1 was unavailable, introducing a distributed check-then-set race condition where replay attacks could slip past during KV eventual consistency windows.
+- **Remediation:** Removed the KV-only fallback in `apps/api/src/middleware/auth.ts`. Cloudflare D1 is now the sole authoritative atomic store using SQLite `PRIMARY KEY (nonce)` constraint enforcement. If the D1 binding is absent, the middleware fails closed with HTTP 401. KV serves strictly as an optional performance read cache.
+- **Verification Proof:**
+  - Vitest Unit Tests: `apps/api/src/__tests__/api.test.ts` (`should reject 401 when D1 binding is missing`).
+
+### FR-14: Multi-Batch D1 Staging Atomicity and Two-Phase Publication
+- **Severity:** HIGH  
+- **Vulnerability:** Multi-batch D1 inserts could fail mid-stream, leaving partial, unverified market data visible and active in production tables for user queries.
+- **Remediation:** Implemented a two-phase staging and publication protocol in `apps/api/src/index.ts`. All staged records (`raw_ingestions`, `daily_bars`, `snapshots`) are written with `is_active = 0` and status `'STAGING'`. Only after all batches succeed is an atomic publication transaction executed setting `is_active = 1` and status `'ACCEPTED'`. If any batch fails, the ingestion is marked `'FAILED'`. Duplicate submissions of the same `ingestion_id` return HTTP 200 idempotently.
+- **Verification Proof:**
+  - Vitest Unit Tests: `apps/api/src/__tests__/api.test.ts` (19 / 19 passed across workspace).
+  - Schema migration: `apps/api/src/db/schema.sql`.
+
+### FR-15: Redundant Archive Writes of Unchanged Intraday Market Snapshots
+- **Severity:** MEDIUM  
+- **Vulnerability:** When the market is static, repeated polling cycles wrote duplicate multi-kilobyte snapshot shards to GitHub Git history, consuming Git repository storage and unnecessary runner minutes.
+- **Remediation:** Implemented persistent, source- and trading-date-aware snapshot hash caching (`snapshot_hashes`) inside `state/budget_and_lease.json`. `pipeline.py` compares the SHA-256 hash of new snapshots against `coordinator.get_last_snapshot_hash(source, trading_date)`. If identical, it records status `DATA_UNCHANGED` and safely skips redundant archive commits.
+- **Verification Proof:**
+  - Unit Test: `test_durable_snapshot_deduplication_skips_duplicate_archive` in `test_pipeline.py`.
+  - Persistent Coordinator Tests: `test_persistent_coordinator_lease_lifecycle` in `test_persistent_budget.py`.
 
 ---
 

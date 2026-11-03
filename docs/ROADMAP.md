@@ -2,15 +2,15 @@
 
 ## Milestone Overview
 
-### M0: Repository, Monorepo Scaffolding, and Cloud Architecture (COMPLETED & LOCKED)
+### M0: Repository, Monorepo Scaffolding, and Cloud Architecture (AWAITING OWNER ACCEPTANCE)
 - [x] Dual-repository boundary: Public application repository (`MahadImran/psx-research-lab`) and strictly private raw data archive (`MahadImran/psx-research-data`).
 - [x] Monorepo structure: `apps/web`, `apps/api`, `services/collector`, `packages/shared`, `docs`.
 - [x] Comprehensive architectural contracts: `ARCHITECTURE.md`, `ADRS.md`, `DATA_CONTRACT.md`, `FOUNDATION_RISK_REGISTER.md`, `RUNBOOK.md`, `COST_LIMITS.md`, `SETUP.md`, `THREAT_MODEL.md`.
 - [x] Zero-dollar posture verification: GitHub Actions minute budgets, Cloudflare Workers Free limits, Gemini free tier constraints.
 - [x] Supply-chain pinning: Strict dependency pinning, vendor isolation, Node 24 / pnpm 10 and Python 3.11/3.14 compatibility.
-- [x] Acceptance sign-off: `docs/M0_ACCEPTANCE.md`.
+- [x] Acceptance sign-off: `docs/M0_ACCEPTANCE.md` (Awaiting Owner Acceptance).
 
-### M1: Source Adapter Abstraction & Bounded PSX Probe (COMPLETED & LOCKED)
+### M1: Source Adapter Abstraction & Bounded PSX Probe (AWAITING OWNER ACCEPTANCE)
 - [x] Python source adapter abstraction (`PSXSourceAdapter`, `PSXDPSAdapter`, `FixtureAdapter`).
 - [x] Upstream 250 requests/24h rolling budget fuse and fail-closed mechanism.
 - [x] HTTP 429/503 circuit breaker with Retry-After header parsing and exponential backoff.
@@ -18,19 +18,24 @@
 - [x] Defensive HTML table fragment parsing (`table_records`).
 - [x] Market trading calendar (`MarketCalendar`): Karachi timezone (UTC+5), regular vs Friday split sessions, public holidays.
 - [x] Bounded read-only probe verified live on GitHub-hosted Linux runner.
-- [x] Acceptance sign-off: `docs/M1_ACCEPTANCE.md`.
+- [x] Acceptance sign-off: `docs/M1_ACCEPTANCE.md` (Awaiting Owner Acceptance).
 
-### M2: Persistent Concurrency, Durable Archiving, & Remediation (COMPLETED & LOCKED)
+### M2: Persistent Concurrency, Durable Archiving, & Remediation (AWAITING OWNER ACCEPTANCE)
 - [x] Distributed lease coordination (`PersistentCoordinator`) with 15-minute TTL and optimistic concurrency (HTTP 409 retry loop with jitter).
 - [x] Remote request pre-reservation: Commits quota reservation remotely before opening outbound network sockets; survives runner crashes.
 - [x] Durable private archival (`DurableArchiveManager`): Level 9 gzip compression sharded by `raw/YYYY/MM/DD/` committed to private repository.
-- [x] Cumulative daily SHA-256 integrity manifest generation (`manifests/YYYY-MM-DD.json`) merging files across all daily cycles without erasing earlier runs.
+- [x] Raw archive object immutability: Rejection of conflicting content at existing raw paths (`ArchiveCommitError`).
+- [x] Cumulative daily SHA-256 integrity manifest generation (`manifests/YYYY-MM-DD.json`) merging files across all daily cycles without erasing earlier runs; Cycle 1 explicitly recorded.
+- [x] Corrupt manifest quarantine: Malformed manifests fail closed and preserve corrupted bytes for forensics.
 - [x] Cryptographic readback verification: Remote commits validated by immediate GET and SHA-256 check with replication lag tolerance.
-- [x] Atomic SQLite replay lock in Cloudflare D1 (`seen_nonces`) eliminating check-then-act race conditions.
+- [x] Durable snapshot deduplication: Tracking `{source}:{trading_date}` SHA-256 hashes to prevent redundant archives.
+- [x] Fail-closed Cloudflare Access edge authentication: Defaulting to `requireAccess !== false`.
+- [x] Atomic SQLite replay lock in Cloudflare D1 (`seen_nonces`) eliminating check-then-act race conditions; removal of KV-only fallback.
+- [x] Two-phase D1 staging and publication protocol (`is_active = 0` during staging, `is_active = 1` upon atomic publication).
 - [x] Multi-tier Data Quality Grades (`GRADE_A`, `GRADE_B`, `GRADE_C`, `QUARANTINE`) with strict candle geometry enforcement.
 - [x] Granular status reporting (`SUCCESS`, `DATA_UNCHANGED`, `ARCHIVE_COMMITTED_INGEST_PENDING`, `ARCHIVE_FAILED`, `INGEST_FAILED`, `MARKET_CLOSED`).
-- [x] Adversarial chaos test suite (`test_adversarial_failures.py`) with 8 passing scenarios.
-- [x] Acceptance sign-off: `docs/M2_ACCEPTANCE.md`.
+- [x] Adversarial chaos test suite (`test_adversarial_failures.py`) with 8 passing scenarios; 71 Python tests passing; 19 TypeScript tests passing.
+- [x] Acceptance sign-off: `docs/M2_ACCEPTANCE.md` (Awaiting Owner Acceptance).
 
 ---
 

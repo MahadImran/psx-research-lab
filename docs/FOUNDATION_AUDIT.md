@@ -1,7 +1,7 @@
 # PSX Research Lab — Foundation Engineering Audit Report (M0–M2 Lockdown)
 
-**Status:** APPROVED & LOCKED  
-**Date:** 2026-11-02  
+**Status:** AWAITING OWNER ACCEPTANCE  
+**Date:** 2026-11-03  
 **Target Architecture:** Free-tier Cloudflare Workers + D1 + KV + GitHub Actions + Private GitHub Data Repository  
 **Scope:** Milestones 0, 1, and 2 Complete Codebase, Infrastructure, Security, and Concurrency Audit  
 
@@ -14,10 +14,10 @@ Pursuant to the **Foundation Lockdown Directive**, an exhaustive, independent en
 Every Python collector component, vendored library, TypeScript schema, Cloudflare edge middleware, and GitHub Actions workflow was audited against strict production requirements:
 1. **$0.00 Recurring Cloud Spend:** Zero paid tiers, zero billable services, zero personal always-on hardware.
 2. **Fail-Closed Security & Concurrency:** Eliminating all local file fallbacks, race conditions, check-then-act vulnerabilities, and false-positive status reporting.
-3. **Durable Data Preservation:** Zero data loss on ephemeral runner disposal, atomic state transitions, cumulative daily manifests, and SHA-256 readback verification.
+3. **Durable Data Preservation:** Zero data loss on ephemeral runner disposal, atomic state transitions, cumulative daily manifests, raw archive immutability, and SHA-256 readback verification.
 4. **Data Integrity & Quarantine:** Strict candle geometry enforcement (`High >= max(Open, Close)`, `Low <= min(Open, Close)`), multi-tier data grades (`GRADE_A`, `GRADE_B`, `GRADE_C`, `QUARANTINE`), and safe nullability handling.
 
-All identified vulnerabilities and architectural flaws have been remediated, verified locally with a 63-test Python suite and a 16-test TypeScript suite, and confirmed live on GitHub-hosted Ubuntu runners against the real PSX DPS upstream and the private GitHub data repository (`MahadImran/psx-research-data`).
+All identified vulnerabilities and architectural flaws have been remediated, verified locally with a 71-test Python suite and a 19-test TypeScript suite, confirmed in CI (Run `41687349531`), and verified live on GitHub Actions runner `41687650867` (Job `126097554138`, Duration 41s) against the real PSX DPS upstream (18 indices, 500 stocks) and the private GitHub data repository (`MahadImran/psx-research-data`).
 
 ---
 
@@ -127,3 +127,21 @@ All identified vulnerabilities and architectural flaws have been remediated, ver
 | **Healthchecks.io** | 20 free monitor checks | 1 ping check allocated | 95% | **$0.00** |
 
 **Audit Conclusion:** Total recurring spend is strictly $0.00. No credit card requirement or paid cloud tier is introduced anywhere in the foundation architecture.
+
+---
+
+## 5. Market Data Coverage Classification Matrix
+
+| Data Stream / Capability | Coverage Status | Evidence & Rationale |
+| :--- | :--- | :--- |
+| **Market Benchmark Indices** | **PASS** | 18 live indices retrieved from PSX DPS and archived; verified on GitHub runners `41386016819` and `41687650867`. |
+| **Whole-Market Stock Snapshot** | **PASS** | 500 active equity symbols retrieved via `/market-watch` and archived; verified on runner `41687650867`. |
+| **Historical Daily EOD Bars** | **PARTIAL** | Upstream adapter and parsing verified with fixtures and probe workflow (`probe.yml`); full multi-year archive backfill deferred to Milestone 3 to honor the 250 requests/day budget ceiling. |
+| **Full-Session Intraday Stream** | **PARTIAL / DEFERRED** | Intraday snapshot schema, deduplication, and quarantine verified; scheduled polling during market sessions is deferred to Milestone 3 when scheduled cron is enabled. |
+
+---
+
+## 6. Audit Sign-off Status
+
+**Status: AWAITING OWNER ACCEPTANCE**  
+The foundation audit and remediation of Milestones 0, 1, and 2 are complete. Milestone 3 remains strictly unauthorized pending owner review and formal acceptance.

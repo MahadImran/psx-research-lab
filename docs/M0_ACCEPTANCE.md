@@ -1,8 +1,8 @@
 # Milestone 0 (M0) Acceptance & Verification Document
 
 **Milestone:** M0 — Foundation, Environment, $0.00 Cloud Boundary, and Tooling  
-**Status:** ACCEPTED & LOCKED  
-**Verification Date:** 2026-11-02  
+**Status:** AWAITING OWNER ACCEPTANCE  
+**Verification Date:** 2026-11-03  
 **Sign-off Criteria:** Zero-dollar hosting contract, repository boundary separation, supply chain pinning, reproducible test runner, secret isolation.
 
 ---
@@ -35,13 +35,13 @@ Milestone 0 establishes the bedrock infrastructure and operational environment f
 ## 3. Engineering Evidence & Runner Artifacts
 
 ### 3.1 GitHub Actions CI Verification
-- **Run ID:** `41385970867`
+- **Run ID:** `41687349531` (prior baseline: `41385970867`)
 - **Workflow:** `CI` (`.github/workflows/ci.yml`)
 - **Trigger:** Push to `main`
 - **Runner OS:** `ubuntu-24.04` (hosted Linux runner)
 - **Results:**
-  - TypeScript Workspace Vitest Suite: **16 / 16 passed** (0 failures, 20s execution time)
-  - Python Collector Pytest Suite: **63 / 63 passed** (0 failures, 13s execution time)
+  - TypeScript Workspace Vitest Suite: **19 / 19 passed** (0 failures, across `@psx/shared`, `@psx/api`, `@psx/web`)
+  - Python Collector Pytest Suite: **71 / 71 passed** (0 failures, including 8 adversarial chaos tests, quota exhaustion, corrupt manifest fail-closed, and immutability checks)
   - Exit Code: `0`
 
 ### 3.2 Secret Leakage Audit
@@ -61,6 +61,7 @@ The following M0 foundational architecture documents are present in `docs/`:
 
 ---
 
-## 4. Milestone 0 Acceptance Sign-off
+## 4. Milestone 0 Acceptance Status
 
-Milestone 0 meets 100% of functional, architectural, and security acceptance criteria. All automated gates pass, and zero cost assumptions have been validated.
+**Status: AWAITING OWNER ACCEPTANCE**  
+Milestone 0 meets 100% of functional, architectural, and security acceptance criteria. All automated gates pass, and zero cost assumptions have been validated. Awaiting owner review and formal acceptance.

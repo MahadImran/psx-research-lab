@@ -1,7 +1,7 @@
 # PSX Research Lab — Data Quality Audit & Source Specification
 
-**Status:** APPROVED  
-**Date:** 2026-11-02  
+**Status:** AWAITING OWNER ACCEPTANCE  
+**Date:** 2026-11-03  
 **Target:** Pakistan Stock Exchange (PSX) Data Ingestion & Storage Pipeline  
 
 ---
@@ -22,27 +22,26 @@ PSX Research Lab interfaces with upstream PSX data interfaces to extract histori
 
 ## 2. PSX Data Schema Realities & Nullability Rules
 
-A critical finding of our empirical source audit is that **upstream PSX feeds do not uniformly provide complete OHLC candles across all endpoints**.
+A critical finding of our empirical source audit is that **upstream PSX feeds exhibit distinct payload structures across different endpoints and session timings**.
 
 ### 2.1 Index Summary Table (`/dps_table.php`)
-- **Observed Behavior:** Upstream HTML table fragments for benchmark indices (`KSE100`, `KSE30`, `KMI30`, `ALLSHR`) frequently omit intraday High and Low values in summary rows.
-- **Empirical Runner Extraction Example:**
+- **Observed Behavior:** Upstream HTML table fragments for benchmark indices (`KSE100`, `KSE30`, `KMI30`, `ALLSHR`, etc.) provide High, Low, Current, and Change fields. However, secondary index rows and auxiliary feeds can intermittently omit or zero intraday High and Low values.
+- **Empirical Runner Extraction Example (Job ID `125086927135`, Timestamp `2026-11-02T04:00:28.190Z`):**
   ```json
   {
-    "index": "KSE100",
-    "current": 166409.25,
-    "change": 812.44,
-    "percentChange": 0.49,
-    "high": null,
-    "low": null,
-    "volume": 840495291
+    "Index": "KSE100",
+    "High": "167338.72",
+    "Low": "166326.69",
+    "Current": "166409.25",
+    "Change": "0",
+    "% Change": "0"
   }
   ```
-- **Architectural Decision:** Treating `high` and `low` as non-nullable floats caused 100% of index summary rows to be rejected. Schema definitions in `packages/shared/src/schemas/market.ts` and `QuarantineAuditor` were updated to treat `high` and `low` as `Optional[float]`.
+- **Architectural Decision:** To ensure resilience against auxiliary index feeds where High and Low are not published, schema definitions in `packages/shared/src/schemas/market.ts` and `QuarantineAuditor` treat `high` and `low` as `Optional[float]` (`dataGrade: GRADE_B`). When High and Low are provided, geometric invariants are strictly enforced.
 
-### 2.2 Equity Symbol Summary Bars
-- Equity daily bars contain full OHLC values.
-- Where High and Low are present, strict geometric invariants are enforced:
+### 2.2 Whole-Market Equity Snapshot (`/market-watch`)
+- **Observed Behavior:** The PSX DPS whole-market equity watch endpoint reliably yields **500 active symbols** with complete OHLCV parameters (Open, High, Low, Current/Close, Volume).
+- **Geometric Invariants Enforced (`GRADE_A`):**
   $$\text{High} \ge \max(\text{Open}, \text{Close})$$
   $$\text{Low} \le \min(\text{Open}, \text{Close})$$
   $$\text{High} \ge \text{Low}$$
@@ -99,3 +98,14 @@ Before validation and archiving, all raw inputs undergo deterministic normalizat
 1. **DPS Index Scraping Latency:** PSX DPS updates index web fragments asynchronously; intraday ticks can lag physical floor execution by 30–90 seconds.
 2. **End-of-Day Settlement Adjustments:** Final closing prices may undergo minor official revisions up to 30 minutes post-session close (16:30 PKT). The reconciliation module detects and logs price revisions (`PRICE_REVISION_DETECTED`).
 3. **Historical Data Gaps:** Historical seed data prior to 2018 may contain intermittent holidays without formal notices. The calendar validator treats unannounced closures gracefully as `MARKET_CLOSED`.
+
+---
+
+## 6. Market Data Coverage Classification Matrix
+
+| Data Stream / Capability | Coverage Status | Evidence & Rationale |
+| :--- | :--- | :--- |
+| **Market Benchmark Indices** | **PASS** | 18 live indices retrieved from PSX DPS and archived; verified on GitHub runners `41386016819` and `41687650867`. |
+| **Whole-Market Stock Snapshot** | **PASS** | 500 active equity symbols retrieved via `/market-watch` and archived; verified on runner `41687650867`. |
+| **Historical Daily EOD Bars** | **PARTIAL** | Upstream adapter and parsing verified with fixtures and probe workflow (`probe.yml`); full multi-year archive backfill deferred to Milestone 3 to honor the 250 requests/day budget ceiling. |
+| **Full-Session Intraday Stream** | **PARTIAL / DEFERRED** | Intraday snapshot schema, deduplication, and quarantine verified; scheduled polling during market sessions is deferred to Milestone 3 when scheduled cron is enabled. |

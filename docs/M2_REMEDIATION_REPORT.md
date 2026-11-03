@@ -1,8 +1,8 @@
 # PSX Research Lab — Milestone 2 Remediation & Acceptance Report
 
 **Milestone:** M2 Remediation — Reliability, Security Hardening & Durable Verification  
-**Date:** 2026-11-02  
-**Status:** REMEDIATED & VERIFIED  
+**Date:** 2026-11-03  
+**Status:** AWAITING OWNER ACCEPTANCE  
 **Mandate:** Zero recurring spend (\$0.00 / month), cloud-only execution, zero secret leakage, fail-closed security.
 
 ---
@@ -130,21 +130,24 @@ When dispatched with repository secrets, it executes the complete 8-step verific
 
 All remediations were tested and verified live on ephemeral GitHub-hosted Ubuntu runners with real production credentials:
 
-### A. Dedicated Durable Archive 8-Step Verification Workflow
-- **Workflow Run:** [41383432374](https://github.com/MahadImran/psx-research-lab/actions/runs/41383432374)
-- **Status:** **SUCCESS (All 8 Steps Passed)**
+### A. Dedicated Durable Archive 10-Step Verification Workflow
+- **Workflow Run:** [41687650867](https://github.com/MahadImran/psx-research-lab/actions/runs/41687650867) (Job ID `126097554138`, Duration 41s, 2026-11-03)
+- **Status:** **SUCCESS (All 10 Steps Passed)**
 - **Runner:** GitHub-hosted `ubuntu-24.04` (Python 3.11.17)
 - **Target Archive:** `MahadImran/psx-research-data`
 - **Verification Evidence:**
-  1. **Remote Lease:** Acquired lease `gha-41383432374` committed to `state/budget_and_lease.json`. Upstream budget remaining: 247/250.
-  2. **Real Upstream Fetch:** Retrieved 18 live indices from PSX upstream in 6201.7 ms (Status 200).
-  3. **Quarantine Validation:** Passed 17/18 active index records (`KSE100`, `NITPGI`, `NBPPGI`, `MZNPI`, `JSMFI`, `ACI`, `JSGBKTI`, `HBLTTI`, `MII30`).
-  4. **Durable Gzip Commit:** Committed raw compressed response `raw/2026/11/02/psx-dps_indices_verify_033023Z_6480c0c6.json.gz` (592 bytes) to `MahadImran/psx-research-data`.
-  5. **Readback Bit-for-Bit Hash Verification:** Re-fetched object from GitHub REST API; computed SHA-256 matched staged hash: `6480c0c608f75b28373b9e4368a513511eb96d11f7ee3f2ee960686ba93bfd2f`.
-  6. **Daily Manifest Commit & Readback:** Generated and committed `manifests/2026-11-02.json` referencing verified raw archive file; readback confirmed identical payload and path pointers.
-  7. **Persistent Budget Accounting:** Verified rolling 24h budget incremented across runs; 1 request consumed and persisted remotely.
-  8. **Idempotency Test:** Repeated identical write against `raw/2026/11/02/...`; detected identical remote content and skipped redundant commit.
-  9. **Lease Cleanup:** Distributed runner lease released cleanly in `finally` block.
+  1. **Remote Lease:** Acquired lease `gha-41687650867` committed to `state/budget_and_lease.json`. Upstream budget remaining: 250/250.
+  2. **Real Upstream Indices:** Retrieved 18 live indices from PSX upstream in 10,538.1 ms (Status 200).
+  3. **Real Upstream Whole-Market Snapshot:** Retrieved 500 active market-wide symbols from PSX DPS in 3,628.5 ms (Status 200).
+  4. **Quarantine Validation:** Passed 18/18 active index records and 500/500 active equity stocks.
+  5. **Durable Gzip Commit:** Committed raw indices shard `raw/2026/11/03/psx-dps_indices_live_174811Z_0bfac25a.json.gz` (914 bytes) and raw whole-market snapshot shard `raw/2026/11/03/psx-dps_market_snapshot_live_174813Z_58af8a39.json.gz` (19,562 bytes) to `MahadImran/psx-research-data`.
+  6. **Readback Bit-for-Bit Hash Verification:** Re-fetched both objects from GitHub REST API; recomputed SHA-256 matched staged hashes:
+     - Indices: `0bfac25a274d2bae4e3380c2d8c0f213f430c2f4068bfbd760525a589682f50f`
+     - Snapshot: `58af8a3953c05b4556530ae6ddf5e96cd4fb453565589fe2e61049265fe51288`
+  7. **Daily Cumulative Manifest Commit & Readback:** Generated and committed `manifests/2026-11-03.json` referencing verified raw archive files and cycle ledger (cumulative files: 2, cycles: 1).
+  8. **Raw Archive Immutability Protection:** Attempted overwrite of raw snapshot with differing bytes; correctly rejected with `ArchiveCommitError`.
+  9. **Idempotency Test:** Repeated identical write against `raw/2026/11/03/...`; detected identical remote content and skipped redundant commit.
+  10. **Persistent Pre-Reservation Budget Tracking:** Tracked 6 requests consumed remotely (remaining: 244/250); released distributed lease cleanly.
 
 ### B. Live Scheduled PSX Collector Workflow
 - **Workflow Run:** [41383515746](https://github.com/MahadImran/psx-research-lab/actions/runs/41383674187)
@@ -160,9 +163,9 @@ All remediations were tested and verified live on ephemeral GitHub-hosted Ubuntu
   - Exited with code 0 (clean operational exit)
 
 ### C. Public CI Validation (Push & Pull Request)
-- **Workflow Run:** [41383637172](https://github.com/MahadImran/psx-research-lab/actions/runs/41383637172)
+- **Workflow Run:** [41687349531](https://github.com/MahadImran/psx-research-lab/actions/runs/41687349531)
 - **Status:** **SUCCESS**
 - **Results:**
-  - `TypeScript Lint & Test`: 16/16 Vitest tests passed, 0 type errors.
-  - `Python Collector Tests`: 47/47 Pytest tests passed on Python 3.11.17 Linux runner.
+  - `TypeScript Lint & Test`: 19/19 Vitest tests passed, 0 type errors.
+  - `Python Collector Tests`: 71/71 Pytest tests passed on Python 3.11.17 Linux runner.
   - Public CI runs without access to privileged secrets and tests fail-closed behavior safely.

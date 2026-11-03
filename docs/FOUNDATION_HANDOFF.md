@@ -1,24 +1,24 @@
 # PSX Research Lab — Foundation Handoff & Milestone 3 Gateway Document
 
-**Status:** LOCKED & AWAITING M3 AUTHORIZATION  
-**Date:** 2026-11-02  
+**Status:** AWAITING OWNER ACCEPTANCE (M3 NOT AUTHORIZED)  
+**Date:** 2026-11-03  
 **Target Architecture:** $0.00/mo Free Tier (Cloudflare + GitHub Actions + Private GitHub Data Repository)  
 
 ---
 
 ## 1. Foundation Operational State
 
-As of 2026-11-02, Milestones 0, 1, and 2 are 100% complete, fully verified, and locked.
+As of 2026-11-03, Milestones 0, 1, and 2 remediation is complete and verified across both automated suites and live runner execution. Milestone 3 is **NOT** authorized and awaits explicit owner review and acceptance.
 
 ### Current Operating Baseline
 - **Application Repository:** `MahadImran/psx-research-lab` (PUBLIC)
 - **Data Archive Repository:** `MahadImran/psx-research-data` (PRIVATE)
 - **Test Suite Status:**
-  - TypeScript: **16 / 16 passed** (Vitest in CI)
-  - Python: **63 / 63 passed** (Pytest in CI, including 8 Adversarial Chaos tests)
+  - TypeScript: **19 / 19 passed** (Vitest in CI across `@psx/shared`, `@psx/api`, `@psx/web`)
+  - Python: **71 / 71 passed** (Pytest in CI, including 8 Adversarial Chaos tests, corrupt manifest handling, immutability, and concurrency)
 - **GitHub Actions Verification:**
-  - `CI` (Run `41385970867`): PASS
-  - `verify_durable_archive.yml` (Run `41386016819`): PASS (Live PSX connection, durable private commit, readback verification)
+  - `CI` (Run `41687349531`): PASS
+  - `verify_durable_archive.yml` (Run `41687650867`): PASS (10/10 steps verified: real PSX indices, real 500-stock snapshot, private durable commit, SHA-256 readback, cumulative manifest with Cycle 1, raw immutability rejection, idempotency, budget quota pre-reservation)
   - `collector.yml` (Run `41386086661`): PASS (`MARKET_CLOSED` clean skip, zero false alerts)
 - **Unattended Schedule:** Disabled (`workflow_dispatch` only). No automated cron triggers are active.
 
