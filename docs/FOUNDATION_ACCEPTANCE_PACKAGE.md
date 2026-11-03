@@ -121,6 +121,7 @@ Below are verifiable excerpts directly from live PSX DPS responses recorded duri
 ```
 
 ### 4.3. Verified GitHub Actions Workflow Evidence
+- **Live Bounded Probe Run:** [Run 41696589374](https://github.com/MahadImran/psx-research-lab/actions/runs/41696589374) (Job `126128644596`, Duration 40s): All 6 live probes passed 100% on GitHub-hosted Ubuntu 24 runner against real PSX DPS endpoints.
 - **Live Collector Run:** [Run 41687650867](https://github.com/MahadImran/psx-research-lab/actions/runs/41687650867) (Job `126097554138`, Duration 41s): All 10 steps passed against real PSX DPS and committed verified compressed objects to `MahadImran/psx-research-data`.
 - **CI Test Suite Run:** [Run 41688684768](https://github.com/MahadImran/psx-research-lab/actions/runs/41688684768) (Job `126101188448`, Duration 1m 5s): 100% test pass rate across TypeScript and Python suites.
 
