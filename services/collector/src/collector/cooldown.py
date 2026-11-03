@@ -7,7 +7,7 @@ Never rotates proxies or bypasses blocks.
 from datetime import datetime, timezone, timedelta
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 
 class CircuitBreakerTrippedError(Exception):
